@@ -29,6 +29,12 @@ cmake_args=(
     -DBEAM_CORE_DIR="$core_dir"
     -DCMAKE_BUILD_TYPE=Release
 )
+if [[ -n "${BOOST_ROOT:-}" ]]; then
+    cmake_args+=("-DBoost_ROOT=$BOOST_ROOT")
+fi
+if [[ -n "${OPENSSL_ROOT_DIR:-}" ]]; then
+    cmake_args+=("-DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR")
+fi
 if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
     cmake_args+=(-DBEAM_SDK_KMP_BUILD_NATIVE_TESTS=ON)
 else

@@ -41,6 +41,82 @@ clone_exact() {
     fi
 }
 
+build_linux_pic_boost_filesystem() {
+    local boost_directory="$1"
+    local filesystem_repository
+    local filesystem_commit
+    local filesystem_source
+    local boost_pic_root
+    local boost_cxx
+    local boost_ar
+    local source_name
+    local source_file
+    local object_file
+    local library
+    local library_name
+    local archive_candidate
+    local -a filesystem_sources
+    local -a filesystem_objects
+    local -a compile_flags
+
+    filesystem_repository="$(read_lock boost_filesystem_repository)"
+    filesystem_commit="$(read_lock boost_filesystem_commit)"
+    filesystem_source="$dependencies_root/boost-filesystem-source"
+    boost_pic_root="$dependencies_root/boost-linux-pic-$filesystem_commit"
+    boost_cxx="${CXX:-c++}"
+    boost_ar="${AR:-ar}"
+
+    clone_exact "$filesystem_repository" "$filesystem_commit" "$filesystem_source"
+    mkdir -p "$boost_pic_root/lib/cmake" "$boost_pic_root/objects"
+    ln -sfn "$boost_directory/include" "$boost_pic_root/include"
+    cp -R "$boost_directory/lib/cmake/." "$boost_pic_root/lib/cmake/"
+
+    for library in "$boost_directory/lib/"*; do
+        library_name="${library##*/}"
+        if [[ "$library_name" != "cmake" && "$library_name" != "libboost_filesystem.a" ]]; then
+            ln -sfn "$library" "$boost_pic_root/lib/$library_name"
+        fi
+    done
+
+    filesystem_sources=(
+        codecvt_error_category.cpp
+        exception.cpp
+        directory.cpp
+        operations.cpp
+        path.cpp
+        path_traits.cpp
+        portability.cpp
+        unique_path.cpp
+        utf8_codecvt_facet.cpp
+    )
+    compile_flags=(
+        -std=c++17
+        -O2
+        -fPIC
+        -DBOOST_ALL_NO_LIB
+        -DBOOST_FILESYSTEM_NO_LIB
+        -DBOOST_FILESYSTEM_SOURCE
+        -DBOOST_FILESYSTEM_STATIC_LINK=1
+        -DBOOST_FILESYSTEM_NO_CXX20_ATOMIC_REF
+        "-I$boost_directory/include"
+        "-I$filesystem_source/src"
+        "-ffile-prefix-map=$filesystem_source=boost-filesystem"
+        "-ffile-prefix-map=$boost_directory=boost"
+    )
+    filesystem_objects=()
+    for source_name in "${filesystem_sources[@]}"; do
+        source_file="$filesystem_source/src/$source_name"
+        object_file="$boost_pic_root/objects/${source_name%.cpp}.o"
+        "$boost_cxx" "${compile_flags[@]}" -c "$source_file" -o "$object_file"
+        filesystem_objects+=("$object_file")
+    done
+
+    archive_candidate="$boost_pic_root/lib/libboost_filesystem.a.$$.tmp"
+    "$boost_ar" rcsD "$archive_candidate" "${filesystem_objects[@]}"
+    mv "$archive_candidate" "$boost_pic_root/lib/libboost_filesystem.a"
+    linux_boost_pic_directory="$boost_pic_root"
+}
+
 mkdir -p "$dependencies_root"
 environment_file="$dependencies_root/environment.sh"
 
@@ -54,6 +130,7 @@ case "$(uname -s)-$(uname -m)" in
         boost_repository="$(read_lock boost_linux_repository)"
         boost_commit="$(read_lock boost_linux_commit)"
         openssl_target="linux-x86_64"
+        rebuild_boost_filesystem=true
         ;;
     MINGW*-x86_64|MSYS*-x86_64)
         boost_repository="$(read_lock boost_windows_repository)"
@@ -78,6 +155,10 @@ esac
 
 boost_directory="$dependencies_root/boost"
 clone_exact "$boost_repository" "$boost_commit" "$boost_directory"
+if [[ "${rebuild_boost_filesystem:-false}" == "true" ]]; then
+    build_linux_pic_boost_filesystem "$boost_directory"
+    boost_directory="$linux_boost_pic_directory"
+fi
 
 openssl_repository="$(read_lock openssl_repository)"
 openssl_commit="$(read_lock openssl_commit)"

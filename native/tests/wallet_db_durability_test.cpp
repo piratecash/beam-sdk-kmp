@@ -79,7 +79,7 @@ int main()
                 false,
                 [](IWalletDB& initializingDatabase)
                 {
-                    storage::setVar(initializingDatabase, "pcash.beam.atomic.create.test", 42);
+                    storage::setVar(initializingDatabase, "beam.sdk.kmp.atomic.create.test", 42);
                     auto concrete = dynamic_cast<WalletDB*>(&initializingDatabase);
                     require(concrete != nullptr, "atomic creation fixture is not a WalletDB");
                     concrete->FailCurrentTransactionForTests();

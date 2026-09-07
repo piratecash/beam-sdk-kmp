@@ -64,16 +64,16 @@ using beam::wallet::WalletStatus;
 namespace AmountBig = beam::AmountBig;
 
 constexpr const char* kWalletFile = "wallet.db";
-constexpr const char* kNetworkVar = "pcash.beam.network.v1";
-constexpr const char* kRestoreVar = "pcash.beam.restore.v1";
-constexpr const char* kRestoreInitializedVar = "pcash.beam.restore.initialized.v1";
-constexpr const char* kRestoreHeightVar = "pcash.beam.restore.height.v1";
-constexpr const char* kRestoreDateVar = "pcash.beam.restore.date.v1";
-constexpr const char* kNewWalletCreatedAtVar = "pcash.beam.new-wallet.created-at.v1";
-constexpr const char* kSnapshotPathVar = "pcash.beam.restore.snapshot.path.v1";
-constexpr const char* kSnapshotUrlVar = "pcash.beam.restore.snapshot.url.v1";
-constexpr const char* kSnapshotHashVar = "pcash.beam.restore.snapshot.sha256.v1";
-constexpr const char* kActiveSendVar = "pcash.beam.send.active.v1";
+constexpr const char* kNetworkVar = "beam.sdk.kmp.network.v1";
+constexpr const char* kRestoreVar = "beam.sdk.kmp.restore.v1";
+constexpr const char* kRestoreInitializedVar = "beam.sdk.kmp.restore.initialized.v1";
+constexpr const char* kRestoreHeightVar = "beam.sdk.kmp.restore.height.v1";
+constexpr const char* kRestoreDateVar = "beam.sdk.kmp.restore.date.v1";
+constexpr const char* kNewWalletCreatedAtVar = "beam.sdk.kmp.new-wallet.created-at.v1";
+constexpr const char* kSnapshotPathVar = "beam.sdk.kmp.restore.snapshot.path.v1";
+constexpr const char* kSnapshotUrlVar = "beam.sdk.kmp.restore.snapshot.url.v1";
+constexpr const char* kSnapshotHashVar = "beam.sdk.kmp.restore.snapshot.sha256.v1";
+constexpr const char* kActiveSendVar = "beam.sdk.kmp.send.active.v1";
 constexpr std::uint64_t kMaxJavaLong = std::numeric_limits<std::int64_t>::max();
 constexpr Height kBirthdaySafetyWindow = 1'440;
 constexpr Timestamp kNewWalletTipFreshnessTolerance = 10 * 60;
@@ -311,7 +311,7 @@ std::pair<std::int64_t, std::string> stableDigest(const std::string& value) {
 }
 
 std::string sendRecordKey(const std::string& operationId) {
-    return "pcash.beam.send.v1." + operationId;
+    return "beam.sdk.kmp.send.v1." + operationId;
 }
 
 void setRawString(IWalletDB& database, const char* key, const std::string& value) {
