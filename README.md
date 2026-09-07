@@ -58,8 +58,8 @@ is responsible for wrapping the DB key with Android Keystore.
 The SDK logs lifecycle transitions, sync phases and failures through Kermit under the `BeamSDK`
 tag, without logging seeds, database keys or payment tokens. The embedding application owns the
 global Kermit writers and severity policy. Both sample hosts install `platformLogWriter()` at Debug
-severity so their runs are diagnosable without additional setup; P.CASH should keep its existing
-debug/release Kermit configuration and must not install a second writer for this SDK.
+severity so their runs are diagnosable without additional setup. An embedding application that
+already configures Kermit must not install a second writer for this SDK.
 
 The selected height/date/full/snapshot restore source is written in the same encrypted WalletDB
 transaction that creates the account, closing the process-death window before the first download or
@@ -152,6 +152,3 @@ The official-node integration test is opt-in because it performs external networ
 BEAM_LIVE_TEST=1 ./gradlew :beam-sdk:desktopTest \
   --tests cash.p.beam.NativeLiveSyncTest --rerun-tasks
 ```
-
-P.CASH integration is intentionally not part of this repository change and starts only after the
-user confirms the target P.CASH branch containing Bitcoin KMP PR #496.
