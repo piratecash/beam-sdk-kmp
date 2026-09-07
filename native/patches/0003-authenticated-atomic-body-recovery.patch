@@ -114,8 +114,8 @@ index 4af56a6..ff8d918 100644
  {
 +    namespace
 +    {
-+        const char kShieldedCountCheckpoints[] = "pcash.beam.shielded.checkpoints.v1";
-+        const char kBodyBirthdayBoundary[] = "pcash.beam.body.birthday.v1";
++        const char kShieldedCountCheckpoints[] = "beam.sdk.kmp.shielded.checkpoints.v1";
++        const char kBodyBirthdayBoundary[] = "beam.sdk.kmp.body.birthday.v1";
 +    }
 +
      using namespace std;

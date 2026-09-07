@@ -4,9 +4,9 @@ index 52857b9..d60b88b 100644
 +++ b/wallet/core/wallet.cpp
 @@ -39,6 +39,7 @@ namespace beam::wallet
      {
-         const char kShieldedCountCheckpoints[] = "pcash.beam.shielded.checkpoints.v1";
-         const char kBodyBirthdayBoundary[] = "pcash.beam.body.birthday.v1";
-+        const char kLowerBodyBoundaryOnRollback[] = "pcash.beam.body.lower-boundary-on-rollback.v1";
+         const char kShieldedCountCheckpoints[] = "beam.sdk.kmp.shielded.checkpoints.v1";
+         const char kBodyBirthdayBoundary[] = "beam.sdk.kmp.body.birthday.v1";
++        const char kLowerBodyBoundaryOnRollback[] = "beam.sdk.kmp.body.lower-boundary-on-rollback.v1";
      }
  
      using namespace std;

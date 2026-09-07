@@ -8,8 +8,8 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-// Same local-only demo seed mechanism as Bitcoin Kit: local.properties is ignored by Git and
-// generates source only under build/. No mnemonic is kept in repository sources.
+// local.properties is ignored by Git and generates source only under build/.
+// No mnemonic is kept in repository sources.
 val generateDemoConfig = tasks.register<GenerateDemoConfig>("generateDemoConfig") {
     localProperties.from(rootProject.layout.projectDirectory.file("local.properties"))
     outputDirectory.set(layout.buildDirectory.dir("generated/demo"))

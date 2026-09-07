@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000009 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Close WalletDB handles after an open failure
+
+SQLCipher retries a failed key with cipher migration. If the retry also fails,
+the raw SQLite handle must be closed before propagating the exception. POSIX
+hosts allow an open database file to be unlinked, but Windows keeps it locked;
+closing here also prevents a process-lifetime handle leak after a wrong key.
+
+diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
+index e35b99a..80d47cc 100644
+--- a/wallet/core/wallet_db.cpp
++++ b/wallet/core/wallet_db.cpp
+@@ -1800,24 +1800,37 @@ namespace beam::wallet
+ 
+         void OpenAndMigrateIfNeeded(const string& path, sqlite3** db, const SecString& password)
+         {
+-            int ret = sqlite3_open_v2(path.c_str(), db, SQLITE_OPEN_READWRITE, nullptr);
+-            throwIfError(ret, *db);
+-            enterKey(*db, password);
+-            // try to decrypt
+-            auto checkKey = [&]() {return sqlite3_exec(*db, "SELECT count(*) FROM sqlite_master;", NULL, NULL, NULL); };
+-            ret = checkKey();
+-            if (ret != SQLITE_OK)
++            try
+             {
+-                BEAM_LOG_INFO() << "Applying PRAGMA cipher_migrate...";
+-                ret = sqlite3_close(*db);
++                int ret = sqlite3_open_v2(path.c_str(), db, SQLITE_OPEN_READWRITE, nullptr);
+                 throwIfError(ret, *db);
+-                ret = sqlite3_open_v2(path.c_str(), db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+-                throwIfError(ret, *db);
+                 enterKey(*db, password);
+-                ret = sqlite3_exec(*db, "PRAGMA cipher_migrate; ", nullptr, nullptr, nullptr);
+-                throwIfError(ret, *db);
++                // try to decrypt
++                auto checkKey = [&]() {return sqlite3_exec(*db, "SELECT count(*) FROM sqlite_master;", NULL, NULL, NULL); };
+                 ret = checkKey();
+-                throwIfError(ret, *db);
++                if (ret != SQLITE_OK)
++                {
++                    BEAM_LOG_INFO() << "Applying PRAGMA cipher_migrate...";
++                    ret = sqlite3_close(*db);
++                    throwIfError(ret, *db);
++                    *db = nullptr;
++                    ret = sqlite3_open_v2(path.c_str(), db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
++                    throwIfError(ret, *db);
++                    enterKey(*db, password);
++                    ret = sqlite3_exec(*db, "PRAGMA cipher_migrate; ", nullptr, nullptr, nullptr);
++                    throwIfError(ret, *db);
++                    ret = checkKey();
++                    throwIfError(ret, *db);
++                }
++            }
++            catch (...)
++            {
++                if (*db)
++                {
++                    sqlite3_close_v2(*db);
++                    *db = nullptr;
++                }
++                throw;
+             }
+         }
+ 

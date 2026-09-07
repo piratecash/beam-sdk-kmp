@@ -136,8 +136,8 @@ To run the desktop demo:
 ./gradlew :sample-desktop:run
 ```
 
-For a local wallet test, put the mnemonic only in the Git-ignored root `local.properties`, following
-the Bitcoin Kit demo convention. The generated config stays under `sample-shared/build/`:
+For a local wallet test, put the mnemonic only in the Git-ignored root `local.properties`. The
+generated config stays under `sample-shared/build/`:
 
 ```properties
 words="<your test BIP39 seed phrase>"
