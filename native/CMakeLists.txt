@@ -14,7 +14,9 @@ endif()
 # Release binaries must not disclose or depend on the local checkout location. This also keeps
 # diagnostics embedded through __FILE__ stable across CI hosts.
 if(MSVC)
+    add_compile_options("/experimental:deterministic")
     add_compile_options("/pathmap:${BEAM_CORE_DIR}=beam-core")
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
     add_compile_options("-ffile-prefix-map=${BEAM_CORE_DIR}=beam-core")
     add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=beam-sdk-native")
@@ -78,6 +80,10 @@ if(ANDROID)
     # Android 15 devices may use 16 KiB pages. A larger ELF max-page-size is
     # backwards compatible with 4 KiB devices and is mandatory for Play delivery.
     target_link_options(beam_sdk_kmp PRIVATE "-Wl,-z,max-page-size=16384")
+elseif(UNIX AND NOT APPLE)
+    # The pinned Beam Ubuntu Boost archive is static and contains locally resolvable
+    # non-PIC references. Bind those symbols inside this self-contained JNI library.
+    target_link_options(beam_sdk_kmp PRIVATE "-Wl,-Bsymbolic")
 endif()
 
 target_compile_definitions(beam_sdk_kmp PRIVATE
