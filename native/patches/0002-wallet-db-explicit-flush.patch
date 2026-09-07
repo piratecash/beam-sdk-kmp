@@ -1,0 +1,17 @@
+diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
+index d134d5f..04acb62 100644
+--- a/wallet/core/wallet_db.h
++++ b/wallet/core/wallet_db.h
+@@ -829,6 +829,12 @@ namespace beam::wallet
+         void set_AppData(const Blob& name, const Blob&, const Blob*) override;
+         void ClearAppData(const Blob& name) override;
+ 
++        // Embedders which mutate WalletDB before starting the Reactor must make
++        // the pending SQL transaction durable synchronously. The standard UI
++        // relies on its running flush timer and cannot provide this guarantee.
++        void FlushNow() { flushDB(); }
++        void RollbackNow() { rollbackDB(); }
++
+     private:
+         static std::shared_ptr<WalletDB> initBase(const std::string& path, const SecString& password, bool separateDBForPrivateData);
+ 

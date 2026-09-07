@@ -1,0 +1,33 @@
+jdk:
+  - openjdk21
+
+before_install:
+  - |
+    (
+      set -eu
+      case "${VERSION:-}" in
+        v*)
+          base="https://github.com/piratecash/beam-sdk-kmp/releases/download/$VERSION"
+          mkdir -p /tmp/beam-natives beam-sdk/prebuilt/desktop/native beam-sdk/prebuilt/android/native
+          for artifact in linux-x64 macos-arm64 windows-x64 android; do
+            curl -fsSL --retry 20 --retry-delay 15 \
+              -o "/tmp/beam-natives/native-$artifact.tar.gz" \
+              "$base/native-$artifact.tar.gz"
+          done
+          curl -fsSL --retry 20 --retry-delay 15 -o /tmp/beam-natives/natives.sha256 "$base/natives.sha256"
+          cd /tmp/beam-natives
+          sha256sum --strict -c natives.sha256
+          tar -xzf native-linux-x64.tar.gz -C "$OLDPWD/beam-sdk/prebuilt/desktop/native"
+          tar -xzf native-macos-arm64.tar.gz -C "$OLDPWD/beam-sdk/prebuilt/desktop/native"
+          tar -xzf native-windows-x64.tar.gz -C "$OLDPWD/beam-sdk/prebuilt/desktop/native"
+          tar -xzf native-android.tar.gz -C "$OLDPWD/beam-sdk/prebuilt/android/native"
+          ;;
+        *)
+          echo "Native release assets are required; publish from a v* tag."
+          exit 1
+          ;;
+      esac
+    )
+
+install:
+  - ./gradlew :beam-sdk:verifyNativeArtifacts :beam-sdk:publishToMavenLocal --no-daemon --console=plain

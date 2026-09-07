@@ -1,0 +1,238 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index f507f9c..6c03991 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -782,17 +782,18 @@ void FlyClient::NetworkStd::OnNewRequests()
+ {
+     if (m_RequireRecoveryQuorum && !m_lst.empty() && IsRecoveryRequest(*m_lst.front().m_pRequest))
+     {
+-        size_t liveCount = 0;
++        std::set<io::Address> liveAddresses;
+         for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+         {
+             Connection& c = *it;
+             if (c.IsLive() && c.IsSecureOut() && c.IsAtTip() &&
+                 (Connection::Flags::Node & c.m_Flags))
+-                ++liveCount;
++                liveAddresses.insert(c.m_Addr);
+         }
+-        if (liveCount < 2)
++        if (liveAddresses.size() < 2)
+             return;
+ 
++        const auto excludedAddress = m_lst.front().m_pRequest->m_RecoveryExcludedAddress;
+         Connection* selected = nullptr;
+         for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+         {
+@@ -800,14 +801,13 @@ void FlyClient::NetworkStd::OnNewRequests()
+             if (!c.IsLive() || !c.IsSecureOut() || !c.IsAtTip() ||
+                 !(Connection::Flags::Node & c.m_Flags))
+                 continue;
+-            if (c.m_Addr == m_LastRecoveryAddress)
++            if (c.m_Addr == excludedAddress)
+                 continue;
+             selected = &c;
+             break;
+         }
+         if (!selected)
+             return;
+-        m_LastRecoveryAddress = selected->m_Addr;
+         selected->AssignRequests(true);
+         return;
+     }
+@@ -1406,6 +1406,8 @@ void FlyClient::NetworkStd::Connection::OnDone(RequestNode& n, bool bMaybeRetry
+             return;
+         }
+ 
++        if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
++            n.m_pRequest->m_RecoveryResponder = m_Addr;
+         m_lst.Finish(n);
+     }
+     else
+diff --git a/core/fly_client.h b/core/fly_client.h
+index 7a621fc..223a441 100644
+--- a/core/fly_client.h
++++ b/core/fly_client.h
+@@ -93,6 +93,10 @@ namespace proto {
+ 			};
+ 
+ 			IHandler* m_pTrg = NULL; // set to NULL if aborted.
++			// Recovery quorum requests carry the actual responder and the peer that a replay must
++			// exclude. This prevents a disconnect/requeue from counting one node twice.
++			io::Address m_RecoveryResponder;
++			io::Address m_RecoveryExcludedAddress;
+ 
+ 			template <typename T>
+ 			T& As()
+@@ -359,7 +363,6 @@ namespace proto {
+ 			typedef boost::intrusive::list<Connection> ConnectionList;
+ 			ConnectionList m_Connections;
+ 			bool m_RequireRecoveryQuorum = false;
+-			io::Address m_LastRecoveryAddress;
+ 			bool IsRecoveryRequest(const Request&) const;
+ 
+ 			Connection* get_ActiveConnection();
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index cdccbc0..52857b9 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -1868,16 +1868,19 @@ namespace beam::wallet
+         if (!m_BodyCandidate)
+         {
+             m_BodyCandidate = digest;
++            m_BodyCandidatePeer = request.m_RecoveryResponder;
+         }
+-        else if (*m_BodyCandidate == digest)
++        else if (m_BodyCandidatePeer != request.m_RecoveryResponder && *m_BodyCandidate == digest)
+         {
+             m_BodyCandidate = boost::none;
++            m_BodyCandidatePeer = io::Address();
+             m_BodyQuorumRetries = 0;
+             return true;
+         }
+-        else
++        else if (m_BodyCandidatePeer != request.m_RecoveryResponder)
+         {
+             m_BodyCandidate = boost::none;
++            m_BodyCandidatePeer = io::Address();
+             if (++m_BodyQuorumRetries > 2)
+             {
+                 ReportBodyQuorumFailure("Beam body quorum mismatch");
+@@ -1888,6 +1891,7 @@ namespace beam::wallet
+         MyRequestBody::Ptr repeated(new MyRequestBody);
+         repeated->m_Msg = request.m_Msg;
+         repeated->m_Height = request.m_Height;
++        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+         PostReqUnique(*repeated);
+         return false;
+     }
+@@ -1897,6 +1901,7 @@ namespace beam::wallet
+         if (request.m_Res.m_Bodies.empty())
+         {
+             m_BodyPackCandidate = boost::none;
++            m_BodyPackCandidatePeer = io::Address();
+             if (++m_BodyPackQuorumRetries > 2)
+             {
+                 ReportBodyQuorumFailure("Beam node returned an empty recovery body pack");
+@@ -1909,16 +1914,20 @@ namespace beam::wallet
+             if (!m_BodyPackCandidate)
+             {
+                 m_BodyPackCandidate = digest;
++                m_BodyPackCandidatePeer = request.m_RecoveryResponder;
+             }
+-            else if (*m_BodyPackCandidate == digest)
++            else if (m_BodyPackCandidatePeer != request.m_RecoveryResponder &&
++                *m_BodyPackCandidate == digest)
+             {
+                 m_BodyPackCandidate = boost::none;
++                m_BodyPackCandidatePeer = io::Address();
+                 m_BodyPackQuorumRetries = 0;
+                 return true;
+             }
+-            else
++            else if (m_BodyPackCandidatePeer != request.m_RecoveryResponder)
+             {
+                 m_BodyPackCandidate = boost::none;
++                m_BodyPackCandidatePeer = io::Address();
+                 if (++m_BodyPackQuorumRetries > 2)
+                 {
+                     ReportBodyQuorumFailure("Beam body-pack quorum mismatch");
+@@ -1930,6 +1939,7 @@ namespace beam::wallet
+         MyRequestBodyPack::Ptr repeated(new MyRequestBodyPack);
+         repeated->m_Msg = request.m_Msg;
+         repeated->m_StartHeight = request.m_StartHeight;
++        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+         PostReqUnique(*repeated);
+         return false;
+     }
+@@ -1940,16 +1950,20 @@ namespace beam::wallet
+         if (!m_ShieldedBoundaryCandidate)
+         {
+             m_ShieldedBoundaryCandidate = count;
++            m_ShieldedBoundaryCandidatePeer = request.m_RecoveryResponder;
+         }
+-        else if (*m_ShieldedBoundaryCandidate == count)
++        else if (m_ShieldedBoundaryCandidatePeer != request.m_RecoveryResponder &&
++            *m_ShieldedBoundaryCandidate == count)
+         {
+             m_ShieldedBoundaryCandidate = boost::none;
++            m_ShieldedBoundaryCandidatePeer = io::Address();
+             m_ShieldedBoundaryQuorumRetries = 0;
+             return true;
+         }
+-        else
++        else if (m_ShieldedBoundaryCandidatePeer != request.m_RecoveryResponder)
+         {
+             m_ShieldedBoundaryCandidate = boost::none;
++            m_ShieldedBoundaryCandidatePeer = io::Address();
+             if (++m_ShieldedBoundaryQuorumRetries > 2)
+             {
+                 ReportBodyQuorumFailure("Beam shielded-boundary quorum mismatch");
+@@ -1960,6 +1974,7 @@ namespace beam::wallet
+         MyRequestShieldedOutputsAt::Ptr repeated(new MyRequestShieldedOutputsAt);
+         repeated->m_Msg = request.m_Msg;
+         repeated->m_callback = request.m_callback;
++        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+         PostReqUnique(*repeated);
+         return false;
+     }
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index edee661..8d9cd0c 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -582,6 +582,9 @@ namespace beam::wallet
+         boost::optional<ECC::Hash::Value> m_BodyCandidate;
+         boost::optional<ECC::Hash::Value> m_BodyPackCandidate;
+         boost::optional<TxoID> m_ShieldedBoundaryCandidate;
++        io::Address m_BodyCandidatePeer;
++        io::Address m_BodyPackCandidatePeer;
++        io::Address m_ShieldedBoundaryCandidatePeer;
+         uint8_t m_BodyQuorumRetries = 0;
+         uint8_t m_BodyPackQuorumRetries = 0;
+         uint8_t m_ShieldedBoundaryQuorumRetries = 0;
+diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
+index 8f17e14..cb62f91 100644
+--- a/wallet/core/wallet_db.cpp
++++ b/wallet/core/wallet_db.cpp
+@@ -5829,7 +5829,13 @@ namespace beam::wallet
+         m_IsFlushPending = false;
+         if (m_DbTransaction)
+         {
+-            m_DbTransaction->commit();
++            if (!m_DbTransaction->commit())
++            {
++                // Destroying an uncommitted transaction rolls it back. Never let callers cross a
++                // durability fence after SQLite rejected COMMIT.
++                m_DbTransaction.reset();
++                throw DatabaseException("failed to commit wallet database transaction");
++            }
+             m_DbTransaction.reset();
+ 
+ #ifdef __EMSCRIPTEN__
+diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
+index f87d486..5a1bed6 100644
+--- a/wallet/core/wallet_db.h
++++ b/wallet/core/wallet_db.h
+@@ -834,7 +834,21 @@ namespace beam::wallet
+         // the pending SQL transaction durable synchronously. The standard UI
+         // relies on its running flush timer and cannot provide this guarantee.
+         void FlushNow() { flushDB(); }
+-        void RollbackNow() { rollbackDB(); }
++        void RollbackNow(bool notifyObservers = true) {
++            rollbackDB();
++            // A rolled-back body may already have populated the parameter cache and emitted
++            // observer notifications. Invalidate the cache and publish authoritative resets so
++            // replay cannot mistake rolled-back parameters for durable rows.
++            m_TxParametersCache.clear();
++            if (notifyObservers) {
++                notifyTransactionChanged(
++                    ChangeAction::Reset,
++                    getTxHistory(wallet::TxType::ALL, 0, std::numeric_limits<int>::max())
++                );
++                notifyCoinsChanged(ChangeAction::Reset, getAllNormalCoins());
++                notifyShieldedCoinsChanged(ChangeAction::Reset, getAllShieldedCoins());
++            }
++        }
+ 
+     private:
+         static std::shared_ptr<WalletDB> initBase(const std::string& path, const SecString& password, bool separateDBForPrivateData);

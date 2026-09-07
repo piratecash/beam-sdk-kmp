@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "testedCommit": "PENDING",
+  "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
+  "android": {
+    "arm64-v8a": {
+      "status": "pending",
+      "device": "PENDING",
+      "apiLevel": 0,
+      "nativeVersion": "PENDING",
+      "walletSmoke": "PENDING",
+      "testedAtUtc": "PENDING"
+    },
+    "armeabi-v7a": {
+      "status": "pending",
+      "device": "PENDING",
+      "apiLevel": 0,
+      "nativeVersion": "PENDING",
+      "walletSmoke": "PENDING",
+      "testedAtUtc": "PENDING"
+    }
+  }
+}

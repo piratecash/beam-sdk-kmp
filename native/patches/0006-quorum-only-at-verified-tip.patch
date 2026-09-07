@@ -1,0 +1,24 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index 87abdbb..f507f9c 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -786,7 +786,8 @@ void FlyClient::NetworkStd::OnNewRequests()
+         for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+         {
+             Connection& c = *it;
+-            if (c.IsLive() && c.IsSecureOut() && (Connection::Flags::Node & c.m_Flags))
++            if (c.IsLive() && c.IsSecureOut() && c.IsAtTip() &&
++                (Connection::Flags::Node & c.m_Flags))
+                 ++liveCount;
+         }
+         if (liveCount < 2)
+@@ -796,7 +797,8 @@ void FlyClient::NetworkStd::OnNewRequests()
+         for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+         {
+             Connection& c = *it;
+-            if (!c.IsLive() || !c.IsSecureOut() || !(Connection::Flags::Node & c.m_Flags))
++            if (!c.IsLive() || !c.IsSecureOut() || !c.IsAtTip() ||
++                !(Connection::Flags::Node & c.m_Flags))
+                 continue;
+             if (c.m_Addr == m_LastRecoveryAddress)
+                 continue;

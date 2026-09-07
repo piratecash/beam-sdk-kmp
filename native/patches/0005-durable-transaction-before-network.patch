@@ -1,0 +1,20 @@
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 3c8e3f6..cdccbc0 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -318,6 +318,15 @@ namespace beam::wallet
+ 
+     void Wallet::ProcessTransaction(wallet::BaseTransaction::Ptr tx)
+     {
++        auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!walletDB)
++            throw std::runtime_error("Beam WalletDB cannot establish the transaction durability fence");
++
++        // ConstructTransactionFromParameters has already persisted the stable TxID and all
++        // immutable parameters. Commit them before UpdateTransaction can reserve coins or send
++        // anything to the node. After a crash, either no transaction exists and retry is safe,
++        // or this exact TxID is durable and ResumeAllTransactions continues it.
++        walletDB->FlushNow();
+         MakeTransactionActive(tx);
+         UpdateTransaction(tx->GetTxID());
+     }

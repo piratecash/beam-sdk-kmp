@@ -1,0 +1,11 @@
+openssl_repository=https://github.com/openssl/openssl.git
+openssl_tag=openssl-3.0.18
+openssl_commit=c10e643222ce5a185f2980d7352d545afacb0fed
+boost_linux_repository=https://github.com/BeamMW/boost_prebuild_ubuntu-22.04.git
+boost_linux_commit=603166c5dcd4a726247d5e6bd2d3a9b3fe18de8c
+boost_macos_repository=https://github.com/BeamMW/boost_prebuild_macos-15.git
+boost_macos_commit=c2227480b6be0638c08f3012366877b9867e0cba
+boost_windows_repository=https://github.com/BeamMW/boost_prebuild_windows-2022.git
+boost_windows_commit=a53681df38cf63fad4dc7d1c778024a951da622b
+windows_libraries_repository=https://github.com/BeamMW/libs.git
+windows_libraries_commit=7c009700b45f1206a388df9f79ec2f5ab6c3789f

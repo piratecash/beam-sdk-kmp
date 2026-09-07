@@ -1,0 +1,493 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index 8730656..87abdbb 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -780,6 +780,36 @@ void FlyClient::NetworkStd::PostRequestInternal(Request& r)
+ 
+ void FlyClient::NetworkStd::OnNewRequests()
+ {
++    if (m_RequireRecoveryQuorum && !m_lst.empty() && IsRecoveryRequest(*m_lst.front().m_pRequest))
++    {
++        size_t liveCount = 0;
++        for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
++        {
++            Connection& c = *it;
++            if (c.IsLive() && c.IsSecureOut() && (Connection::Flags::Node & c.m_Flags))
++                ++liveCount;
++        }
++        if (liveCount < 2)
++            return;
++
++        Connection* selected = nullptr;
++        for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
++        {
++            Connection& c = *it;
++            if (!c.IsLive() || !c.IsSecureOut() || !(Connection::Flags::Node & c.m_Flags))
++                continue;
++            if (c.m_Addr == m_LastRecoveryAddress)
++                continue;
++            selected = &c;
++            break;
++        }
++        if (!selected)
++            return;
++        m_LastRecoveryAddress = selected->m_Addr;
++        selected->AssignRequests(true);
++        return;
++    }
++
+     for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+     {
+         Connection& c = *it;
+@@ -791,6 +821,13 @@ void FlyClient::NetworkStd::OnNewRequests()
+     }
+ }
+ 
++bool FlyClient::NetworkStd::IsRecoveryRequest(const Request& request) const
++{
++    return request.get_Type() == Request::Type::ShieldedOutputsAt ||
++        request.get_Type() == Request::Type::BodyPack ||
++        request.get_Type() == Request::Type::Body;
++}
++
+ void FlyClient::NetworkStd::Connection::OnMsg(DependentContextChanged&& msg)
+ {
+     if (msg.m_vCtxs.empty())
+@@ -819,11 +856,18 @@ bool FlyClient::NetworkStd::Connection::IsAtTip() const
+     return m_This.m_Client.get_History().get_Tip(sTip) && (sTip == m_Tip);
+ }
+ 
+-void FlyClient::NetworkStd::Connection::AssignRequests()
++void FlyClient::NetworkStd::Connection::AssignRequests(bool quorumSelected)
+ {
+     if (!(Flags::Node & m_Flags))
+         return;
+ 
++    if (!quorumSelected && m_This.m_RequireRecoveryQuorum && !m_This.m_lst.empty() &&
++        m_This.IsRecoveryRequest(*m_This.m_lst.front().m_pRequest))
++    {
++        m_This.OnNewRequests();
++        return;
++    }
++
+     // currently we have no requests that can be assigned unless at tip.
+     if (!IsAtTip())
+         return;
+diff --git a/core/fly_client.h b/core/fly_client.h
+index 8a185c2..7a621fc 100644
+--- a/core/fly_client.h
++++ b/core/fly_client.h
+@@ -223,6 +223,7 @@ namespace proto {
+ 			
+ 			RequestList m_lst; // idle
+ 			void OnNewRequests();
++			void SetRecoveryQuorum(bool enabled) { m_RequireRecoveryQuorum = enabled; }
+ 
+ 			struct Config {
+ 				std::vector<io::Address> m_vNodes;
+@@ -292,7 +293,7 @@ namespace proto {
+ 				Block::SystemState::Full m_Tip;
+ 
+ 				RequestList m_lst; // in progress
+-				void AssignRequests();
++				void AssignRequests(bool quorumSelected = false);
+ 				void AssignRequest(RequestNode&);
+ 
+ 				void SendLoginPlus();
+@@ -357,6 +358,9 @@ namespace proto {
+ 
+ 			typedef boost::intrusive::list<Connection> ConnectionList;
+ 			ConnectionList m_Connections;
++			bool m_RequireRecoveryQuorum = false;
++			io::Address m_LastRecoveryAddress;
++			bool IsRecoveryRequest(const Request&) const;
+ 
+ 			Connection* get_ActiveConnection();
+ 
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 4af56a6..ff8d918 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -35,6 +35,12 @@
+ 
+ namespace beam::wallet
+ {
++    namespace
++    {
++        const char kShieldedCountCheckpoints[] = "pcash.beam.shielded.checkpoints.v1";
++        const char kBodyBirthdayBoundary[] = "pcash.beam.body.birthday.v1";
++    }
++
+     using namespace std;
+     using namespace ECC;
+ 
+@@ -149,6 +155,8 @@ namespace beam::wallet
+         RegisterTransactionType(TxType::Contract, make_unique<ContractTransaction::Creator>(m_WalletDB));
+         m_IsTreasuryHandled = storage::isTreasuryHandled(*m_WalletDB);
+         m_Extra.m_ShieldedOutputs = m_WalletDB->get_ShieldedOuts();
++        storage::getBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
++        storage::getVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+     }
+ 
+     struct Wallet::VoucherManager::Ser {
+@@ -1541,6 +1549,12 @@ namespace beam::wallet
+ 
+         m_Extra.m_ShieldedOutputs = shieldedOutputsBefore;
+         m_WalletDB->set_ShieldedOuts(shieldedOutputsBefore);
++        m_ShieldedCountCheckpoints.clear();
++        if (heightInclusive > 0)
++            m_ShieldedCountCheckpoints.emplace(heightInclusive - 1, shieldedOutputsBefore);
++        storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
++        m_BodyBirthdayBoundary = heightInclusive;
++        storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+         storage::setNextEventHeight(*m_WalletDB, heightInclusive);
+         SetTreasuryHandled(heightInclusive != 0);
+         storage::setNeedToRequestBodies(*m_WalletDB, true);
+@@ -1551,6 +1565,8 @@ namespace beam::wallet
+ 
+     void Wallet::OnRequestComplete(MyRequestShieldedOutputsAt& r)
+     {
++        if (!CheckShieldedBoundaryQuorum(r))
++            return;
+         r.m_callback(r.m_Msg.m_Height, r.m_Res.m_ShieldedOuts);
+     }
+ 
+@@ -1670,33 +1686,66 @@ namespace beam::wallet
+ 
+     void Wallet::OnRequestComplete(MyRequestBodyPack& r)
+     {
++        if (!CheckBodyPackQuorum(r))
++            return;
++        auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!walletDB)
++        {
++            ReportBodyQuorumFailure("Beam WalletDB cannot provide atomic body processing");
++            return;
++        }
++        walletDB->FlushNow();
++        const auto previousExtra = m_Extra;
++        const auto previousBlocksDone = m_BlocksDone;
++        const auto previousTreasuryHandled = m_IsTreasuryHandled;
++        const auto previousShieldedCountCheckpoints = m_ShieldedCountCheckpoints;
+         RecognizerHandler h(*this, m_WalletDB->get_OwnerKdf());
+         NodeProcessor::Recognizer recognizer(h, m_Extra);
+         try 
+         {
+             Height startHeight = r.m_StartHeight;
+-            if (!r.m_Res.m_Bodies.empty())
+-            {
+-                RequestBodies(r.m_Msg.m_Block0.v, startHeight + r.m_Res.m_Bodies.size());
+-            }
+             for (const auto& b : r.m_Res.m_Bodies)
+             {
++                const auto previousCount = m_Extra.m_ShieldedOutputs;
+                 ProcessBody(b, startHeight, recognizer);
++                SaveShieldedCountCheckpoint(startHeight, previousCount);
+ 
+                 ++startHeight;
+             }
+             assert(GetEventsHeightNext() == startHeight);
+ 
+             m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
++            walletDB->FlushNow();
++            RequestBodies(r.m_Msg.m_Block0.v, startHeight);
+         }
+-        catch (const std::exception&)
++        catch (const std::exception& error)
+         {
++            walletDB->RollbackNow();
++            m_Extra = previousExtra;
++            m_BlocksDone = previousBlocksDone;
++            m_IsTreasuryHandled = previousTreasuryHandled;
++            m_ShieldedCountCheckpoints = previousShieldedCountCheckpoints;
++            ResetCommitmentsCache();
++            ReportBodyQuorumFailure(error.what());
+             return;
+         }
+     }
+ 
+     void Wallet::OnRequestComplete(MyRequestBody& r)
+     {
++        if (!CheckBodyQuorum(r))
++            return;
++        auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!walletDB)
++        {
++            ReportBodyQuorumFailure("Beam WalletDB cannot provide atomic body processing");
++            return;
++        }
++        walletDB->FlushNow();
++        const auto previousExtra = m_Extra;
++        const auto previousBlocksDone = m_BlocksDone;
++        const auto previousTreasuryHandled = m_IsTreasuryHandled;
++        const auto previousShieldedCountCheckpoints = m_ShieldedCountCheckpoints;
+         RecognizerHandler h(*this, m_WalletDB->get_OwnerKdf());
+         NodeProcessor::Recognizer recognizer(h, m_Extra);
+         try
+@@ -1709,7 +1758,7 @@ namespace beam::wallet
+                     const Blob& blob = r.m_Res.m_Body.m_Eternal;
+                     Treasury::Data td;
+                     if (!NodeProcessor::ExtractTreasury(blob, td))
+-                        return;
++                        throw std::runtime_error("Beam recovery treasury body is malformed");
+ 
+                     for (size_t iG = 0; iG < td.m_vGroups.size(); iG++)
+                     {
+@@ -1718,21 +1767,199 @@ namespace beam::wallet
+                 }
+ 
+                 SetTreasuryHandled(true);
++                SaveShieldedCountCheckpoint(0, previousExtra.m_ShieldedOutputs);
++                m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
++                walletDB->FlushNow();
+                 RequestBodies(0, 1);
+                 return;
+             }
+ 
+             ProcessBody(r.m_Res.m_Body, r.m_Height, recognizer);
++            SaveShieldedCountCheckpoint(r.m_Height, previousExtra.m_ShieldedOutputs);
++            m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
++            walletDB->FlushNow();
+ 
+             if (r.m_Height < r.m_Msg.m_Top.m_Number.v)
+             {
+                 RequestBodies(r.m_Height, r.m_Height+1);
+             }
+         }
+-        catch (const std::exception&)
+-        {
+-            return;
+-        }
+-    }
++        catch (const std::exception& error)
++        {
++            walletDB->RollbackNow();
++            m_Extra = previousExtra;
++            m_BlocksDone = previousBlocksDone;
++            m_IsTreasuryHandled = previousTreasuryHandled;
++            m_ShieldedCountCheckpoints = previousShieldedCountCheckpoints;
++            ResetCommitmentsCache();
++            ReportBodyQuorumFailure(error.what());
++            return;
++        }
++    }
++
++    ECC::Hash::Value Wallet::BodyDigest(const proto::Body& body) const
++    {
++        ECC::Hash::Value digest;
++        ECC::Hash::Processor()
++            << Blob(body.m_Body.m_Perishable)
++            << Blob(body.m_Body.m_Eternal)
++            >> digest;
++        return digest;
++    }
++
++    ECC::Hash::Value Wallet::BodyPackDigest(const proto::BodyPack& bodyPack) const
++    {
++        ECC::Hash::Processor processor;
++        processor << static_cast<uint64_t>(bodyPack.m_Bodies.size());
++        for (const auto& body : bodyPack.m_Bodies)
++            processor << Blob(body.m_Perishable) << Blob(body.m_Eternal);
++        ECC::Hash::Value digest;
++        processor >> digest;
++        return digest;
++    }
++
++    bool Wallet::CheckBodyQuorum(MyRequestBody& request)
++    {
++        auto digest = BodyDigest(request.m_Res);
++        if (!m_BodyCandidate)
++        {
++            m_BodyCandidate = digest;
++        }
++        else if (*m_BodyCandidate == digest)
++        {
++            m_BodyCandidate = boost::none;
++            m_BodyQuorumRetries = 0;
++            return true;
++        }
++        else
++        {
++            m_BodyCandidate = boost::none;
++            if (++m_BodyQuorumRetries > 2)
++            {
++                ReportBodyQuorumFailure("Beam body quorum mismatch");
++                return false;
++            }
++        }
++
++        MyRequestBody::Ptr repeated(new MyRequestBody);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_Height = request.m_Height;
++        PostReqUnique(*repeated);
++        return false;
++    }
++
++    bool Wallet::CheckBodyPackQuorum(MyRequestBodyPack& request)
++    {
++        if (request.m_Res.m_Bodies.empty())
++        {
++            m_BodyPackCandidate = boost::none;
++            if (++m_BodyPackQuorumRetries > 2)
++            {
++                ReportBodyQuorumFailure("Beam node returned an empty recovery body pack");
++                return false;
++            }
++        }
++        else
++        {
++            auto digest = BodyPackDigest(request.m_Res);
++            if (!m_BodyPackCandidate)
++            {
++                m_BodyPackCandidate = digest;
++            }
++            else if (*m_BodyPackCandidate == digest)
++            {
++                m_BodyPackCandidate = boost::none;
++                m_BodyPackQuorumRetries = 0;
++                return true;
++            }
++            else
++            {
++                m_BodyPackCandidate = boost::none;
++                if (++m_BodyPackQuorumRetries > 2)
++                {
++                    ReportBodyQuorumFailure("Beam body-pack quorum mismatch");
++                    return false;
++                }
++            }
++        }
++
++        MyRequestBodyPack::Ptr repeated(new MyRequestBodyPack);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_StartHeight = request.m_StartHeight;
++        PostReqUnique(*repeated);
++        return false;
++    }
++
++    bool Wallet::CheckShieldedBoundaryQuorum(MyRequestShieldedOutputsAt& request)
++    {
++        auto count = request.m_Res.m_ShieldedOuts;
++        if (!m_ShieldedBoundaryCandidate)
++        {
++            m_ShieldedBoundaryCandidate = count;
++        }
++        else if (*m_ShieldedBoundaryCandidate == count)
++        {
++            m_ShieldedBoundaryCandidate = boost::none;
++            m_ShieldedBoundaryQuorumRetries = 0;
++            return true;
++        }
++        else
++        {
++            m_ShieldedBoundaryCandidate = boost::none;
++            if (++m_ShieldedBoundaryQuorumRetries > 2)
++            {
++                ReportBodyQuorumFailure("Beam shielded-boundary quorum mismatch");
++                return false;
++            }
++        }
++
++        MyRequestShieldedOutputsAt::Ptr repeated(new MyRequestShieldedOutputsAt);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_callback = request.m_callback;
++        PostReqUnique(*repeated);
++        return false;
++    }
++
++    void Wallet::ReportBodyQuorumFailure(const char* message)
++    {
++        storage::setNeedToRequestBodies(*m_WalletDB, true);
++        if (m_BodyQuorumFailureHandler)
++            m_BodyQuorumFailureHandler(message);
++    }
++
++    void Wallet::SaveShieldedCountCheckpoint(Height height, TxoID previousCount)
++    {
++        if (m_Extra.m_ShieldedOutputs == previousCount)
++            return;
++        m_ShieldedCountCheckpoints[height] = m_Extra.m_ShieldedOutputs;
++        storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
++    }
++
++    void Wallet::RestoreShieldedCountAfterRollback(Height tipHeight)
++    {
++        if (m_BodyBirthdayBoundary && tipHeight + 1 < m_BodyBirthdayBoundary)
++        {
++            m_ShieldedCountCheckpoints.clear();
++            m_BodyBirthdayBoundary = 0;
++            storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
++            storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
++            m_Extra.m_ShieldedOutputs = 0;
++            m_WalletDB->set_ShieldedOuts(0);
++            storage::setNextEventHeight(*m_WalletDB, 0);
++            SetTreasuryHandled(false);
++            storage::setNeedToRequestBodies(*m_WalletDB, true);
++            return;
++        }
++
++        auto afterTip = m_ShieldedCountCheckpoints.upper_bound(tipHeight);
++        m_ShieldedCountCheckpoints.erase(afterTip, m_ShieldedCountCheckpoints.end());
++        TxoID count = 0;
++        if (!m_ShieldedCountCheckpoints.empty())
++            count = m_ShieldedCountCheckpoints.rbegin()->second;
++        m_Extra.m_ShieldedOutputs = count;
++        m_WalletDB->set_ShieldedOuts(count);
++        storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
++        storage::setNeedToRequestBodies(*m_WalletDB, true);
++    }
+ 
+     void Wallet::ProcessBody(const proto::BodyBuffers& b, Height h, NodeProcessor::Recognizer& recognizer)
+@@ -2145,6 +2372,7 @@ namespace beam::wallet
+         {
+             SetEventsHeight(id.m_Height);
+         }
++        RestoreShieldedCountAfterRollback(id.m_Height);
+     }
+ 
+     void Wallet::OnEventsSerif(const Hash::Value& hv, Height h)
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index 244b438..8ec240b 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -196,6 +196,9 @@ namespace beam::wallet
+         // output count obtained for heightInclusive - 1. The caller must authenticate
+         // and quorum-check that count before invoking this method.
+         void StartBodyRequestsAt(Height heightInclusive, TxoID shieldedOutputsBefore);
++        void SetBodyQuorumFailureHandler(std::function<void(const std::string&)>&& handler) {
++            m_BodyQuorumFailureHandler = std::move(handler);
++        }
+         void RequestAssetsListAt(Height h, std::function<void(std::vector<beam::Asset::Full>&&)>&& onRequestComplete);
+         bool IsConnectedToOwnNode() const;
+         bool CanDetectCoins() const;
+@@ -468,6 +471,14 @@ namespace beam::wallet
+ #undef REQUEST_Cmp_less_Single
+ #undef REQUEST_Cmp_less_Multiple
+ 
++        ECC::Hash::Value BodyDigest(const proto::Body& body) const;
++        ECC::Hash::Value BodyPackDigest(const proto::BodyPack& bodyPack) const;
++        bool CheckBodyQuorum(MyRequestBody& request);
++        bool CheckBodyPackQuorum(MyRequestBodyPack& request);
++        bool CheckShieldedBoundaryQuorum(MyRequestShieldedOutputsAt& request);
++        void ReportBodyQuorumFailure(const char* message);
++        void SaveShieldedCountCheckpoint(Height height, TxoID previousCount);
++        void RestoreShieldedCountAfterRollback(Height tipHeight);
+ 
+         IWalletDB::Ptr m_WalletDB; 
+         
+@@ -562,6 +573,15 @@ namespace beam::wallet
+         bool m_IsTreasuryHandled = false;
+         std::map<ECC::Point, Height> m_Commitments;
+         bool m_IsCommitmentsCached = false;
++        boost::optional<ECC::Hash::Value> m_BodyCandidate;
++        boost::optional<ECC::Hash::Value> m_BodyPackCandidate;
++        boost::optional<TxoID> m_ShieldedBoundaryCandidate;
++        uint8_t m_BodyQuorumRetries = 0;
++        uint8_t m_BodyPackQuorumRetries = 0;
++        uint8_t m_ShieldedBoundaryQuorumRetries = 0;
++        std::function<void(const std::string&)> m_BodyQuorumFailureHandler;
++        std::map<Height, TxoID> m_ShieldedCountCheckpoints;
++        Height m_BodyBirthdayBoundary = 0;
+ 
+         // the queue of actions to be performed after wallet synchronization
+         using ActionQueue = std::queue<OnSyncAction>;

@@ -1,0 +1,6 @@
+boost_repository=https://github.com/BeamMW/boost-android.git
+boost_branch=boost-1.90
+boost_commit=3686875630f11ee7f09a9f7c3ae45d448df3ffb0
+openssl_repository=https://github.com/BeamMW/openssl-android.git
+openssl_branch=master
+openssl_commit=14023e60e74bf616bfe08258f19568ceb2e1a246

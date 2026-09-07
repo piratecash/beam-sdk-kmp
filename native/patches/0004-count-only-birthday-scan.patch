@@ -1,0 +1,163 @@
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 8507a93..3c8e3f6 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -1541,22 +1541,28 @@ namespace beam::wallet
+         m_WalletDB->set_AidMax(r.m_Res.m_AssetsMax);
+     }
+ 
+-    void Wallet::StartBodyRequestsAt(Height heightInclusive, TxoID shieldedOutputsBefore)
++    void Wallet::StartBodyRequestsAt(
++        Height scanHeightInclusive,
++        TxoID shieldedOutputsBefore,
++        Height recognitionHeightInclusive
++    )
+     {
+         assertThread();
++        if (recognitionHeightInclusive < scanHeightInclusive)
++            throw std::invalid_argument("Beam recognition height precedes the body-scan checkpoint");
+         AbortEvents();
+         AbortBodiesRequests();
+ 
+         m_Extra.m_ShieldedOutputs = shieldedOutputsBefore;
+         m_WalletDB->set_ShieldedOuts(shieldedOutputsBefore);
+         m_ShieldedCountCheckpoints.clear();
+-        if (heightInclusive > 0)
+-            m_ShieldedCountCheckpoints.emplace(heightInclusive - 1, shieldedOutputsBefore);
++        if (scanHeightInclusive > 0)
++            m_ShieldedCountCheckpoints.emplace(scanHeightInclusive - 1, shieldedOutputsBefore);
+         storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+-        m_BodyBirthdayBoundary = heightInclusive;
++        m_BodyBirthdayBoundary = recognitionHeightInclusive;
+         storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+-        storage::setNextEventHeight(*m_WalletDB, heightInclusive);
+-        SetTreasuryHandled(heightInclusive != 0);
++        storage::setNextEventHeight(*m_WalletDB, scanHeightInclusive);
++        SetTreasuryHandled(scanHeightInclusive != 0);
+         storage::setNeedToRequestBodies(*m_WalletDB, true);
+ 
+         ResetCommitmentsCache();
+@@ -1684,6 +1690,18 @@ namespace beam::wallet
+         }
+     };
+ 
++    struct Wallet::CountOnlyRecognizerHandler : NodeProcessor::Recognizer::IHandler
++    {
++        NodeProcessor::Account m_Account;
++
++        explicit CountOnlyRecognizerHandler(const Key::IPKdf::Ptr& pKdf)
++        {
++            m_Account.m_pOwner = pKdf;
++            m_Account.InitFromOwner();
++            m_pAccount = &m_Account;
++        }
++    };
++
+     void Wallet::OnRequestComplete(MyRequestBodyPack& r)
+     {
+         if (!CheckBodyPackQuorum(r))
+@@ -1699,15 +1717,22 @@ namespace beam::wallet
+         const auto previousBlocksDone = m_BlocksDone;
+         const auto previousTreasuryHandled = m_IsTreasuryHandled;
+         const auto previousShieldedCountCheckpoints = m_ShieldedCountCheckpoints;
+-        RecognizerHandler h(*this, m_WalletDB->get_OwnerKdf());
++        const auto ownerKdf = m_WalletDB->get_OwnerKdf();
++        RecognizerHandler h(*this, ownerKdf);
++        CountOnlyRecognizerHandler countOnlyHandler(ownerKdf);
+         NodeProcessor::Recognizer recognizer(h, m_Extra);
++        NodeProcessor::Recognizer countOnlyRecognizer(countOnlyHandler, m_Extra);
+         try 
+         {
+             Height startHeight = r.m_StartHeight;
+             for (const auto& b : r.m_Res.m_Bodies)
+             {
+                 const auto previousCount = m_Extra.m_ShieldedOutputs;
+-                ProcessBody(b, startHeight, recognizer);
++                ProcessBody(
++                    b,
++                    startHeight,
++                    startHeight < m_BodyBirthdayBoundary ? countOnlyRecognizer : recognizer
++                );
+                 SaveShieldedCountCheckpoint(startHeight, previousCount);
+ 
+                 ++startHeight;
+@@ -1746,8 +1771,11 @@ namespace beam::wallet
+         const auto previousBlocksDone = m_BlocksDone;
+         const auto previousTreasuryHandled = m_IsTreasuryHandled;
+         const auto previousShieldedCountCheckpoints = m_ShieldedCountCheckpoints;
+-        RecognizerHandler h(*this, m_WalletDB->get_OwnerKdf());
++        const auto ownerKdf = m_WalletDB->get_OwnerKdf();
++        RecognizerHandler h(*this, ownerKdf);
++        CountOnlyRecognizerHandler countOnlyHandler(ownerKdf);
+         NodeProcessor::Recognizer recognizer(h, m_Extra);
++        NodeProcessor::Recognizer countOnlyRecognizer(countOnlyHandler, m_Extra);
+         try
+         {
+             if (r.m_Height == 0)
+@@ -1762,7 +1790,10 @@ namespace beam::wallet
+ 
+                     for (size_t iG = 0; iG < td.m_vGroups.size(); iG++)
+                     {
+-                        recognizer.RecognizeBlock(td.m_vGroups[iG].m_Data, 0, false);
++                        auto& activeRecognizer = 0 < m_BodyBirthdayBoundary
++                            ? countOnlyRecognizer
++                            : recognizer;
++                        activeRecognizer.RecognizeBlock(td.m_vGroups[iG].m_Data, 0, false);
+                     }
+                 }
+ 
+@@ -1774,7 +1805,11 @@ namespace beam::wallet
+                 return;
+             }
+ 
+-            ProcessBody(r.m_Res.m_Body, r.m_Height, recognizer);
++            ProcessBody(
++                r.m_Res.m_Body,
++                r.m_Height,
++                r.m_Height < m_BodyBirthdayBoundary ? countOnlyRecognizer : recognizer
++            );
+             SaveShieldedCountCheckpoint(r.m_Height, previousExtra.m_ShieldedOutputs);
+             m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
+             walletDB->FlushNow();
+@@ -1940,9 +1975,7 @@ namespace beam::wallet
+         if (m_BodyBirthdayBoundary && tipHeight + 1 < m_BodyBirthdayBoundary)
+         {
+             m_ShieldedCountCheckpoints.clear();
+-            m_BodyBirthdayBoundary = 0;
+             storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+-            storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+             m_Extra.m_ShieldedOutputs = 0;
+             m_WalletDB->set_ShieldedOuts(0);
+             storage::setNextEventHeight(*m_WalletDB, 0);
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index 8ec240b..edee661 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -192,10 +192,15 @@ namespace beam::wallet
+         void RequestVouchersFrom(const WalletID& peerID, const WalletID& myID, uint32_t nCount = 1);
+         virtual void OnVouchersFrom(const WalletAddress&, const WalletID& myID, std::vector<ShieldedTxo::Voucher>&&);
+         void RequestShieldedOutputsAt(Height h, std::function<void(Height, TxoID)>&& onRequestComplete);
+-        // Starts mobile body recognition at heightInclusive using a cumulative shielded
+-        // output count obtained for heightInclusive - 1. The caller must authenticate
+-        // and quorum-check that count before invoking this method.
+-        void StartBodyRequestsAt(Height heightInclusive, TxoID shieldedOutputsBefore);
++        // Starts mobile body processing at scanHeightInclusive using a cumulative shielded
++        // output count obtained for scanHeightInclusive - 1. Bodies below
++        // recognitionHeightInclusive only advance the global shielded index; wallet-owned
++        // records are created starting at recognitionHeightInclusive.
++        void StartBodyRequestsAt(
++            Height scanHeightInclusive,
++            TxoID shieldedOutputsBefore,
++            Height recognitionHeightInclusive
++        );
+         void SetBodyQuorumFailureHandler(std::function<void(const std::string&)>&& handler) {
+             m_BodyQuorumFailureHandler = std::move(handler);
+         }
+@@ -534,6 +539,7 @@ namespace beam::wallet
+         } m_VoucherManager;
+ 
+         struct RecognizerHandler;
++        struct CountOnlyRecognizerHandler;
+ 
+         // List of registered transaction creators
+         // Creators can store some objects for the transactions, 

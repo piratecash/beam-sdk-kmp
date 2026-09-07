@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -395,7 +395,9 @@ else()
+ #Boost end
+ 
+ include_directories(${PROJECT_SOURCE_DIR})
+-add_definitions(-DPROJECT_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\")
++# Keep logger source trimming deterministic and prevent release binaries from embedding the
++# builder's absolute checkout path. The SDK compiler maps __FILE__ to this same stable prefix.
++add_definitions(-DPROJECT_SOURCE_DIR=\"beam-core\")
+ 
+ include_directories(${PROJECT_SOURCE_DIR}/3rdparty)
+ 

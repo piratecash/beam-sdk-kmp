@@ -1,0 +1,193 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index 6c03991..c84180c 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -825,7 +825,8 @@ void FlyClient::NetworkStd::OnNewRequests()
+ 
+ bool FlyClient::NetworkStd::IsRecoveryRequest(const Request& request) const
+ {
+-    return request.get_Type() == Request::Type::ShieldedOutputsAt ||
++    return request.get_Type() == Request::Type::EnumHdrs ||
++        request.get_Type() == Request::Type::ShieldedOutputsAt ||
+         request.get_Type() == Request::Type::BodyPack ||
+         request.get_Type() == Request::Type::Body;
+ }
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index d60b88b..953bc4a 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -616,6 +616,7 @@ namespace beam::wallet
+ 
+     WALLET_REQUEST_Single(Events)
+     WALLET_REQUEST_Single(StateSummary)
++    WALLET_REQUEST_Single(EnumHdrs)
+     WALLET_REQUEST_Single(ShieldedOutputsAt)
+     WALLET_REQUEST_Single(BodyPack)
+     WALLET_REQUEST_Single(Body)
+@@ -1590,6 +1591,14 @@ namespace beam::wallet
+         r.m_callback(r.m_Msg.m_Height, r.m_Res.m_ShieldedOuts);
+     }
+ 
++    void Wallet::OnRequestComplete(MyRequestEnumHdrs& r)
++    {
++        if (!CheckHistoricalHeaderQuorum(r))
++            return;
++        const auto& state = r.m_vStates.front();
++        r.m_callback(state.get_Height(), state.m_TimeStamp);
++    }
++
+     void Wallet::OnRequestComplete(MyRequestAssetsListAt& r)
+     {
+         Height tipHeight = get_TipHeight();
+@@ -1984,6 +1993,58 @@ namespace beam::wallet
+         return false;
+     }
+ 
++    bool Wallet::CheckHistoricalHeaderQuorum(MyRequestEnumHdrs& request)
++    {
++        HeightHash id;
++        const bool valid = request.m_vStates.size() == 1 &&
++            request.m_vStates.front().get_Height() == request.m_Msg.m_Height.m_Min;
++        if (valid)
++            request.m_vStates.front().get_ID(id);
++
++        if (!valid)
++        {
++            m_HistoricalHeaderCandidate = boost::none;
++            m_HistoricalHeaderCandidatePeer = io::Address();
++            if (++m_HistoricalHeaderQuorumRetries > 2)
++            {
++                ReportBodyQuorumFailure("Beam nodes could not provide the requested historical header");
++                return false;
++            }
++        }
++        else if (!m_HistoricalHeaderCandidate)
++        {
++            m_HistoricalHeaderCandidate = id;
++            m_HistoricalHeaderCandidateTimestamp = request.m_vStates.front().m_TimeStamp;
++            m_HistoricalHeaderCandidatePeer = request.m_RecoveryResponder;
++        }
++        else if (m_HistoricalHeaderCandidatePeer != request.m_RecoveryResponder &&
++            *m_HistoricalHeaderCandidate == id &&
++            m_HistoricalHeaderCandidateTimestamp == request.m_vStates.front().m_TimeStamp)
++        {
++            m_HistoricalHeaderCandidate = boost::none;
++            m_HistoricalHeaderCandidatePeer = io::Address();
++            m_HistoricalHeaderQuorumRetries = 0;
++            return true;
++        }
++        else if (m_HistoricalHeaderCandidatePeer != request.m_RecoveryResponder)
++        {
++            m_HistoricalHeaderCandidate = boost::none;
++            m_HistoricalHeaderCandidatePeer = io::Address();
++            if (++m_HistoricalHeaderQuorumRetries > 2)
++            {
++                ReportBodyQuorumFailure("Beam historical-header quorum mismatch");
++                return false;
++            }
++        }
++
++        MyRequestEnumHdrs::Ptr repeated(new MyRequestEnumHdrs);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_callback = request.m_callback;
++        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
++        PostReqUnique(*repeated);
++        return false;
++    }
++
+     void Wallet::ReportBodyQuorumFailure(const char* message)
+     {
+         storage::setNeedToRequestBodies(*m_WalletDB, true);
+@@ -2770,6 +2831,15 @@ namespace beam::wallet
+     {
+         BEAM_LOG_DEBUG() << txId << "[" << subTxID << "]" << " sending tx for registration";
+ 
++        auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!walletDB)
++            throw std::runtime_error("Beam WalletDB cannot establish the registration durability fence");
++
++        // Signing can finish asynchronously after ProcessTransaction's initial fence. Commit the
++        // final kernel, offsets, coin reservations and registration state before the request can
++        // enter the network queue. A failed COMMIT therefore cannot cross the broadcast boundary.
++        walletDB->FlushNow();
++
+ #ifndef NDEBUG
+         TxBase::Context ctx;
+         ctx.m_Height.m_Min = m_WalletDB->getCurrentHeight();
+@@ -3049,6 +3119,17 @@ namespace beam::wallet
+         PostReqUnique(*pVal);
+     }
+ 
++    void Wallet::RequestHistoricalHeaderAt(
++        Height h,
++        std::function<void(Height, Timestamp)>&& onRequestComplete
++    )
++    {
++        MyRequestEnumHdrs::Ptr pVal(new MyRequestEnumHdrs);
++        pVal->m_Msg.m_Height = h;
++        pVal->m_callback = std::move(onRequestComplete);
++        PostReqUnique(*pVal);
++    }
++
+     void Wallet::RequestAssetsListAt(Height h, std::function<void(std::vector<beam::Asset::Full>&&)>&& onRequestComplete)
+     {
+         if (!m_PendingAssetsListAt.empty())
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index d1ddbcc..48bc30b 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -192,6 +192,10 @@ namespace beam::wallet
+         void RequestVouchersFrom(const WalletID& peerID, const WalletID& myID, uint32_t nCount = 1);
+         virtual void OnVouchersFrom(const WalletAddress&, const WalletID& myID, std::vector<ShieldedTxo::Voucher>&&);
+         void RequestShieldedOutputsAt(Height h, std::function<void(Height, TxoID)>&& onRequestComplete);
++        void RequestHistoricalHeaderAt(
++            Height h,
++            std::function<void(Height, Timestamp)>&& onRequestComplete
++        );
+         // Starts mobile body processing at scanHeightInclusive using a cumulative shielded
+         // output count obtained for scanHeightInclusive - 1. Bodies below
+         // recognitionHeightInclusive only advance the global shielded index; wallet-owned
+@@ -398,6 +402,10 @@ namespace beam::wallet
+             {
+                 std::function<void(Height, TxoID)> m_callback;
+             };
++            struct EnumHdrs
++            {
++                std::function<void(Height, Timestamp)> m_callback;
++            };
+             struct BodyPack
+             {
+                 Height m_StartHeight = MaxHeight;
+@@ -471,6 +479,7 @@ namespace beam::wallet
+ 	macro(ProofShieldedOutp) \
+ 	macro(Asset) \
+ 	macro(StateSummary) \
++	macro(EnumHdrs) \
+ 	macro(ShieldedOutputsAt) \
+     macro(BodyPack) \
+     macro(Body) \
+@@ -488,6 +497,7 @@ namespace beam::wallet
+         bool CheckBodyQuorum(MyRequestBody& request);
+         bool CheckBodyPackQuorum(MyRequestBodyPack& request);
+         bool CheckShieldedBoundaryQuorum(MyRequestShieldedOutputsAt& request);
++        bool CheckHistoricalHeaderQuorum(MyRequestEnumHdrs& request);
+         void ReportBodyQuorumFailure(const char* message);
+         void SaveShieldedCountCheckpoint(Height height, TxoID previousCount);
+         void RestoreShieldedCountAfterRollback(Height tipHeight);
+@@ -589,12 +599,16 @@ namespace beam::wallet
+         boost::optional<ECC::Hash::Value> m_BodyCandidate;
+         boost::optional<ECC::Hash::Value> m_BodyPackCandidate;
+         boost::optional<TxoID> m_ShieldedBoundaryCandidate;
++        boost::optional<HeightHash> m_HistoricalHeaderCandidate;
++        Timestamp m_HistoricalHeaderCandidateTimestamp = 0;
+         io::Address m_BodyCandidatePeer;
+         io::Address m_BodyPackCandidatePeer;
+         io::Address m_ShieldedBoundaryCandidatePeer;
++        io::Address m_HistoricalHeaderCandidatePeer;
+         uint8_t m_BodyQuorumRetries = 0;
+         uint8_t m_BodyPackQuorumRetries = 0;
+         uint8_t m_ShieldedBoundaryQuorumRetries = 0;
++        uint8_t m_HistoricalHeaderQuorumRetries = 0;
+         std::function<void(const std::string&)> m_BodyQuorumFailureHandler;
+         std::map<Height, TxoID> m_ShieldedCountCheckpoints;
+         Height m_BodyBirthdayBoundary = 0;

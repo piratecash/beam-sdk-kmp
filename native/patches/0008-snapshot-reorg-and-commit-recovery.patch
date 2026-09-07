@@ -1,0 +1,132 @@
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 52857b9..d60b88b 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -39,6 +39,7 @@ namespace beam::wallet
+     {
+         const char kShieldedCountCheckpoints[] = "pcash.beam.shielded.checkpoints.v1";
+         const char kBodyBirthdayBoundary[] = "pcash.beam.body.birthday.v1";
++        const char kLowerBodyBoundaryOnRollback[] = "pcash.beam.body.lower-boundary-on-rollback.v1";
+     }
+ 
+     using namespace std;
+@@ -157,6 +158,7 @@ namespace beam::wallet
+         m_Extra.m_ShieldedOutputs = m_WalletDB->get_ShieldedOuts();
+         storage::getBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+         storage::getVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
++        storage::getVar(*m_WalletDB, kLowerBodyBoundaryOnRollback, m_LowerBodyBoundaryOnRollback);
+     }
+ 
+     struct Wallet::VoucherManager::Ser {
+@@ -1553,7 +1555,8 @@ namespace beam::wallet
+     void Wallet::StartBodyRequestsAt(
+         Height scanHeightInclusive,
+         TxoID shieldedOutputsBefore,
+-        Height recognitionHeightInclusive
++        Height recognitionHeightInclusive,
++        bool lowerRecognitionBoundaryOnRollback
+     )
+     {
+         assertThread();
+@@ -1570,6 +1573,8 @@ namespace beam::wallet
+         storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+         m_BodyBirthdayBoundary = recognitionHeightInclusive;
+         storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
++        m_LowerBodyBoundaryOnRollback = lowerRecognitionBoundaryOnRollback;
++        storage::setVar(*m_WalletDB, kLowerBodyBoundaryOnRollback, m_LowerBodyBoundaryOnRollback);
+         storage::setNextEventHeight(*m_WalletDB, scanHeightInclusive);
+         SetTreasuryHandled(scanHeightInclusive != 0);
+         storage::setNeedToRequestBodies(*m_WalletDB, true);
+@@ -1999,6 +2004,14 @@ namespace beam::wallet
+         if (m_BodyBirthdayBoundary && tipHeight + 1 < m_BodyBirthdayBoundary)
+         {
+             m_ShieldedCountCheckpoints.clear();
++            if (m_LowerBodyBoundaryOnRollback)
++            {
++                // A snapshot already recognized its original branch through the boundary. If a
++                // reorg crosses it, replacement blocks must be fully recognized from the fork.
++                // Rescan older common-chain bodies count-only to reconstruct shielded indices.
++                m_BodyBirthdayBoundary = tipHeight + 1;
++                storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
++            }
+             storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+             m_Extra.m_ShieldedOutputs = 0;
+             m_WalletDB->set_ShieldedOuts(0);
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index 8d9cd0c..d1ddbcc 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -199,11 +199,18 @@ namespace beam::wallet
+         void StartBodyRequestsAt(
+             Height scanHeightInclusive,
+             TxoID shieldedOutputsBefore,
+-            Height recognitionHeightInclusive
++            Height recognitionHeightInclusive,
++            bool lowerRecognitionBoundaryOnRollback = false
+         );
+         void SetBodyQuorumFailureHandler(std::function<void(const std::string&)>&& handler) {
+             m_BodyQuorumFailureHandler = std::move(handler);
+         }
++#ifdef BEAM_SDK_KMP_TESTS
++        void RestoreBodyStateAfterRollbackForTests(Height tipHeight) {
++            RestoreShieldedCountAfterRollback(tipHeight);
++        }
++        Height BodyRecognitionBoundaryForTests() const { return m_BodyBirthdayBoundary; }
++#endif
+         void RequestAssetsListAt(Height h, std::function<void(std::vector<beam::Asset::Full>&&)>&& onRequestComplete);
+         bool IsConnectedToOwnNode() const;
+         bool CanDetectCoins() const;
+@@ -591,6 +598,7 @@ namespace beam::wallet
+         std::function<void(const std::string&)> m_BodyQuorumFailureHandler;
+         std::map<Height, TxoID> m_ShieldedCountCheckpoints;
+         Height m_BodyBirthdayBoundary = 0;
++        bool m_LowerBodyBoundaryOnRollback = false;
+ 
+         // the queue of actions to be performed after wallet synchronization
+         using ActionQueue = std::queue<OnSyncAction>;
+diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
+index cb62f91..e35b99a 100644
+--- a/wallet/core/wallet_db.cpp
++++ b/wallet/core/wallet_db.cpp
+@@ -5834,6 +5834,9 @@ namespace beam::wallet
+                 // Destroying an uncommitted transaction rolls it back. Never let callers cross a
+                 // durability fence after SQLite rejected COMMIT.
+                 m_DbTransaction.reset();
++                // setTxParameter populates this cache before COMMIT. Keeping those entries after
++                // rollback can make a retry skip the corresponding SQL writes entirely.
++                m_TxParametersCache.clear();
+                 throw DatabaseException("failed to commit wallet database transaction");
+             }
+             m_DbTransaction.reset();
+@@ -5849,6 +5852,15 @@ namespace beam::wallet
+         }
+     }
+ 
++#ifdef BEAM_SDK_KMP_TESTS
++    void WalletDB::FailCurrentTransactionForTests()
++    {
++        if (!m_DbTransaction)
++            throw std::logic_error("no wallet database transaction to fail");
++        m_DbTransaction->rollback();
++    }
++#endif
++
+     void WalletDB::onPrepareToModify()
+     {
+         if (!m_DbTransaction)
+diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
+index 5a1bed6..9df7f19 100644
+--- a/wallet/core/wallet_db.h
++++ b/wallet/core/wallet_db.h
+@@ -849,6 +849,11 @@ namespace beam::wallet
+                 notifyShieldedCoinsChanged(ChangeAction::Reset, getAllShieldedCoins());
+             }
+         }
++#ifdef BEAM_SDK_KMP_TESTS
++        // Deterministically force the next FlushNow COMMIT to fail after a transaction has
++        // accumulated changes. Only compiled into the dedicated native regression-test build.
++        void FailCurrentTransactionForTests();
++#endif
+ 
+     private:
+         static std::shared_ptr<WalletDB> initBase(const std::string& path, const SecString& password, bool separateDBForPrivateData);
