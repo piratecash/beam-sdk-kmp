@@ -38,13 +38,19 @@ if [[ "$triple" == "aarch64-apple-darwin" ]]; then
     cmake_args+=(-DCMAKE_OSX_ARCHITECTURES=arm64)
 fi
 cmake "${cmake_args[@]}"
-build_config_args=()
-if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
-    build_config_args=(--config Release)
-fi
-cmake --build "$build_dir" "${build_config_args[@]}" --target beam_sdk_kmp --parallel
+
+build_target() {
+    local target="$1"
+    if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
+        cmake --build "$build_dir" --config Release --target "$target" --parallel
+    else
+        cmake --build "$build_dir" --target "$target" --parallel
+    fi
+}
+
+build_target beam_sdk_kmp
 if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
-    cmake --build "$build_dir" "${build_config_args[@]}" --target beam_sdk_kmp_native_tests --parallel
+    build_target beam_sdk_kmp_native_tests
     if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
         test_binary="$build_dir/Release/beam_sdk_kmp_native_tests.exe"
     else
