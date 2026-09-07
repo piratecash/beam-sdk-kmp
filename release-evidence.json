@@ -1,23 +1,23 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "PENDING",
+  "testedCommit": "814d133d49616d81b9137552d40f2ec100639fe0",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
   "android": {
     "arm64-v8a": {
-      "status": "pending",
-      "device": "PENDING",
-      "apiLevel": 0,
-      "nativeVersion": "PENDING",
-      "walletSmoke": "PENDING",
-      "testedAtUtc": "PENDING"
+      "status": "passed",
+      "device": "Pixel 6 API 28 emulator",
+      "apiLevel": 28,
+      "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
+      "walletSmoke": "passed",
+      "testedAtUtc": "2026-09-07T07:21:24Z"
     },
     "armeabi-v7a": {
-      "status": "pending",
-      "device": "PENDING",
-      "apiLevel": 0,
-      "nativeVersion": "PENDING",
-      "walletSmoke": "PENDING",
-      "testedAtUtc": "PENDING"
+      "status": "passed",
+      "device": "Pixel 6",
+      "apiLevel": 37,
+      "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
+      "walletSmoke": "passed",
+      "testedAtUtc": "2026-09-07T07:21:24Z"
     }
   }
 }
