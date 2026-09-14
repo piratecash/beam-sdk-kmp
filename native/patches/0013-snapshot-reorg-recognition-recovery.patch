@@ -1,0 +1,1322 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index 55bebb0..03f2845 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -718,6 +718,8 @@ void FlyClient::NetworkStd::Connection::PostChainworkProof(const StateArray& arr
+             }
+         }
+ 
++        if (bRolledBack)
++            m_This.m_Client.OnRollingBack(w.m_LowErase);
+         m_This.m_Client.get_History().DeleteFrom(w.m_LowErase);
+ 
+         // if more connections are opened simultaneously - notify them
+@@ -758,6 +760,8 @@ void FlyClient::INetwork::PostRequest(Request& r, Request::IHandler& h)
+ 
+ void FlyClient::NetworkStd::PostRequestInternal(Request& r)
+ {
++    if (m_RequestEpoch && r.m_WalletEpoch == UINT64_MAX)
++        r.m_WalletEpoch = m_RequestEpoch(); // bind direct BBS/transport requests once, never on retry
+     assert(r.m_pTrg);
+ 
+     if (Request::Type::BbsMsg == r.get_Type())
+@@ -920,6 +924,12 @@ void FlyClient::NetworkStd::Connection::AssignRequests(bool quorumSelected)
+ void FlyClient::NetworkStd::Connection::AssignRequest(RequestNode& n)
+ {
+     assert(n.m_pRequest);
++    if (m_This.m_RequestAdmission && !m_This.m_RequestAdmission(*n.m_pRequest))
++    {
++        n.m_pRequest->m_pTrg = nullptr; // cancellation must not synthesize a failure callback
++        m_lst.Finish(n);
++        return;
++    }
+ 
+     if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
+         m_This.ClearRecoveryResponse(*n.m_pRequest);
+@@ -968,9 +978,15 @@ void FlyClient::NetworkStd::Connection::OnMsg(msgIn&& msg) \
+ { \
+     auto& n = get_FirstRequest(); \
+     auto& r = n.m_pRequest->As<Request##type>(); \
++    if (!r.m_pTrg || (m_This.m_RequestAdmission && !m_This.m_RequestAdmission(r))) \
++    { \
++        r.m_pTrg = nullptr; \
++        OnDone(n, false); \
++        return; \
++    } \
+     r.m_Res = std::move(msg); \
+  \
+-     OnRequestData(r); \
++    OnRequestData(r); \
+  \
+     OnDone(n); \
+ }
+@@ -1384,6 +1400,12 @@ void FlyClient::NetworkStd::Connection::OnMsg(proto::AssetsListAt&& msg)
+ {
+     auto& n = get_FirstRequest();
+     auto& r = n.m_pRequest->As<RequestAssetsListAt>();
++    if (!r.m_pTrg || (m_This.m_RequestAdmission && !m_This.m_RequestAdmission(r)))
++    {
++        r.m_pTrg = nullptr;
++        OnDone(n, false);
++        return;
++    }
+ 
+     if (msg.m_Assets.empty())
+     {
+diff --git a/core/fly_client.h b/core/fly_client.h
+index cc158b1..5920690 100644
+--- a/core/fly_client.h
++++ b/core/fly_client.h
+@@ -97,6 +97,8 @@ namespace proto {
+ 			// exclude. This prevents a disconnect/requeue from counting one node twice.
+ 			io::Address m_RecoveryResponder;
+ 			io::Address m_RecoveryExcludedAddress;
++            uint64_t m_WalletEpoch = UINT64_MAX;
++            bool m_RecoveryProof = false;
+ 
+ 			template <typename T>
+ 			T& As()
+@@ -175,6 +177,7 @@ namespace proto {
+ 		virtual ~FlyClient() {}
+ 		virtual void OnNewTip() {} // tip already added
+ 		virtual void OnTipUnchanged() {} // we have connected to node, but the tip has not changed
++        virtual void OnRollingBack(Height firstRemoved) {} // before mutating durable history
+ 		virtual void OnRolledBack() {} // reversed states are already removed
+ 		virtual void get_Kdf(Key::IKdf::Ptr&) {} // get the master kdf. Optional
+         virtual void get_OwnerKdf(Key::IPKdf::Ptr&) {} // get the owner kdf. Optional
+@@ -228,6 +231,9 @@ namespace proto {
+ 			RequestList m_lst; // idle
+ 			void OnNewRequests();
+ 			void SetRecoveryQuorum(bool enabled) { m_RequireRecoveryQuorum = enabled; }
++            // Checked at the last send/re-send boundary, including queued registrations.
++            std::function<bool(const Request&)> m_RequestAdmission;
++            std::function<uint64_t()> m_RequestEpoch;
+ #ifdef BEAM_SDK_KMP_TESTS
+             static void ClearRecoveryResponseForTests(Request& request) {
+                 ClearRecoveryResponse(request);
+diff --git a/wallet/client/wallet_client.cpp b/wallet/client/wallet_client.cpp
+index 456004e..1f214e6 100644
+--- a/wallet/client/wallet_client.cpp
++++ b/wallet/client/wallet_client.cpp
+@@ -729,6 +729,9 @@ namespace beam::wallet
+                 wallet->SetNodeEndpoint(nodeNetwork);
+                 wallet->AddMessageEndpoint(walletNetwork);
+ 
++                if (wallet->RecoveryPolicyEnabled())
++                    wallet->ConfigureRecoveryQuorum();
++
+                 wallet->ResumeAllTransactions();
+ 
+                 updateMaxPrivacyStatsImpl(getStatus());
+diff --git a/wallet/core/base_transaction.cpp b/wallet/core/base_transaction.cpp
+index e3f1ce6..0a0db36 100644
+--- a/wallet/core/base_transaction.cpp
++++ b/wallet/core/base_transaction.cpp
+@@ -106,7 +106,8 @@ namespace beam::wallet
+         : m_txType(txType)
+         , m_Context{ context }
+     {
+-        assert(context.GetWalletDB());
++        assert(context.GetWalletDB());
++        m_InstanceEpoch = context.get_Wallet().TransactionEpoch();
+     }
+ 
+     BaseTransaction::~BaseTransaction()
+@@ -173,8 +174,15 @@ namespace beam::wallet
+         return m_Context.GetTxID();
+     }
+ 
+-    void BaseTransaction::Update()
+-    {
++    bool BaseTransaction::CanProcess() const
++    {
++        return !m_Retired && m_Context.get_Wallet().CanProcessTransaction(*this);
++    }
++
++    void BaseTransaction::Update()
++    {
++        if (!CanProcess())
++            return;
+         AsyncContextHolder async(m_Context.GetGateway());
+         try
+         {
+@@ -413,8 +421,10 @@ namespace beam::wallet
+         SetParameter(TxParameterID::Status, s, true, m_Context.GetSubTxID());
+     }
+ 
+-    void BaseTransaction::OnFailed(TxFailureReason reason, bool notify)
+-    {
++    void BaseTransaction::OnFailed(TxFailureReason reason, bool notify)
++    {
++        if (!CanProcess())
++            return;
+         BEAM_LOG_ERROR() << m_Context << " Failed. " << GetFailureMessage(reason);
+ 
+         if (notify)
+diff --git a/wallet/core/base_transaction.h b/wallet/core/base_transaction.h
+index b201650..ff8064b 100644
+--- a/wallet/core/base_transaction.h
++++ b/wallet/core/base_transaction.h
+@@ -140,6 +140,11 @@ namespace beam::wallet
+ 
+         const TxID& GetTxID() const;
+         void Update() override;
++        // An instance belongs to one engine epoch for its entire lifetime. In particular,
++        // UpdateOnSynced and signer handlers must never revive a replaced object.
++        bool CanProcess() const;
++        uint64_t InstanceEpoch() const { return m_InstanceEpoch; }
++        void Retire() { m_Retired = true; }
+         bool CanCancel() const override;
+         void Cancel() override;
+ 
+@@ -324,6 +329,8 @@ namespace beam::wallet
+     protected:
+         TxType m_txType;
+         TxContext m_Context;
++        uint64_t m_InstanceEpoch = 0;
++        bool m_Retired = false;
+         mutable boost::optional<bool> m_IsInitiator;
+         io::AsyncEvent::Ptr m_EventToUpdate;
+     };
+diff --git a/wallet/core/base_tx_builder.cpp b/wallet/core/base_tx_builder.cpp
+index eb1adfe..0fde9d3 100644
+--- a/wallet/core/base_tx_builder.cpp
++++ b/wallet/core/base_tx_builder.cpp
+@@ -39,7 +39,8 @@ namespace beam::wallet
+ 
+     BaseTxBuilder::KeyKeeperHandler::KeyKeeperHandler(BaseTxBuilder& b, Stage& s)
+     {
+-        m_pBuilder = b.weak_from_this();
++        m_pBuilder = b.weak_from_this();
++        m_InstanceEpoch = b.m_Tx.InstanceEpoch();
+ 
+         m_pStage = &s;
+         assert(Stage::None == s);
+@@ -66,14 +67,24 @@ namespace beam::wallet
+         }
+     }
+ 
+-    void BaseTxBuilder::KeyKeeperHandler::OnDone(IPrivateKeyKeeper2::Status::Type n)
++    bool BaseTxBuilder::KeyKeeperHandler::IsCurrent(BaseTxBuilder& b)
++    {
++        if (m_InstanceEpoch == b.m_Tx.InstanceEpoch() && b.m_Tx.CanProcess())
++            return true;
++        Detach(b, Stage::None);
++        return false;
++    }
++
++    void BaseTxBuilder::KeyKeeperHandler::OnDone(IPrivateKeyKeeper2::Status::Type n)
+     {
+         if (m_pStage)
+         {
+             std::shared_ptr<BaseTxBuilder> pBld = m_pBuilder.lock();
+             if (pBld)
+             {
+-                BaseTxBuilder& b = *pBld;
++                BaseTxBuilder& b = *pBld;
++                if (!IsCurrent(b))
++                    return;
+                 if (IPrivateKeyKeeper2::Status::Success == n)
+                 {
+                     ITransaction::Ptr pGuard(b.m_Tx.shared_from_this()); // extra ref on transaction object.
+@@ -718,9 +729,12 @@ namespace beam::wallet
+                 return;
+             BaseTxBuilder& b = *pBldr;
+ 
+-            auto pTx = weakTx.lock();
+-            if (!pTx)
+-                return;
++            auto pTx = weakTx.lock();
++            if (!pTx)
++                return;
++
++            if (!pHandler->IsCurrent(b))
++                return;
+ 
+             try {
+                 if (!pHandler->OnList(b, msg))
+diff --git a/wallet/core/base_tx_builder.h b/wallet/core/base_tx_builder.h
+index 97b3098..1006e58 100644
+--- a/wallet/core/base_tx_builder.h
++++ b/wallet/core/base_tx_builder.h
+@@ -160,7 +160,9 @@ namespace beam::wallet
+             KeyKeeperHandler(BaseTxBuilder&, Stage& s);
+             ~KeyKeeperHandler() override;
+ 
+-            void OnDone(IPrivateKeyKeeper2::Status::Type) override;
++            void OnDone(IPrivateKeyKeeper2::Status::Type) override;
++            bool IsCurrent(BaseTxBuilder&);
++            uint64_t m_InstanceEpoch = 0;
+ 
+             virtual void OnSuccess(BaseTxBuilder&) = 0;
+             virtual void OnFailed(BaseTxBuilder&, IPrivateKeyKeeper2::Status::Type);
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index b741cb6..c6ad2aa 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -159,6 +159,32 @@ namespace beam::wallet
+         storage::getBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+         storage::getVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+         storage::getVar(*m_WalletDB, kLowerBodyBoundaryOnRollback, m_LowerBodyBoundaryOnRollback);
++        int source = 0;
++        m_RecoveryPolicy = storage::getVar(*m_WalletDB, "beam.sdk.kmp.restore.v1", source);
++        if (m_RecoveryPolicy)
++        {
++            auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++            if (!db) throw std::runtime_error("Recovery requires WalletDB");
++            db->SetSelectionAllowed(false);
++            if (!storage::getBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery))
++            {
++                m_RecognitionRecovery.m_OriginalBirthday = m_BodyBirthdayBoundary;
++                m_RecognitionRecovery.m_Boundary = m_BodyBirthdayBoundary;
++                // Legacy snapshot provenance cannot prove the common-prefix ledger complete.
++                bool initialized = false;
++                storage::getVar(*db, "beam.sdk.kmp.restore.initialized.v1", initialized);
++                if (source == 4 && initialized)
++                {
++                    m_RecognitionRecovery.m_Snapshot = true;
++                    m_RecognitionRecovery.m_Phase = RecognitionRecovery::Reset;
++                    storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
++                    db->FlushNow();
++                }
++            }
++            if (m_RecognitionRecovery.m_Version != 1)
++                throw std::runtime_error("Unknown recovery metadata version");
++            m_TransactionEpoch = m_RecognitionRecovery.m_Generation;
++        }
+     }
+ 
+     struct Wallet::VoucherManager::Ser {
+@@ -171,6 +197,7 @@ namespace beam::wallet
+ 
+     Wallet::~Wallet()
+     {
++        m_RecoveryLifetime.reset();
+         CleanupNetwork();
+     }
+ 
+@@ -311,6 +338,8 @@ namespace beam::wallet
+ 
+     TxID Wallet::StartTransaction(const TxParameters& parameters)
+     {
++        if (!IsRecoveryAdmissionOpen())
++            throw std::runtime_error("Beam recovery admission deferred");
+         auto tx = ConstructTransactionFromParameters(parameters);
+         if (!tx)
+         {
+@@ -500,6 +529,13 @@ namespace beam::wallet
+ 
+     void Wallet::ResumeAllTransactions()
+     {
++        if (m_RecoveryPolicy && (m_RecognitionRecovery.m_RollbackPending ||
++            m_RecognitionRecovery.m_Phase == RecognitionRecovery::Reset))
++        {
++            if (m_RecognitionRecovery.m_RollbackPending)
++                m_WalletDB->get_History().DeleteFrom(m_RecognitionRecovery.m_Anchor.m_Height + 1);
++            OnRolledBack();
++        }
+         // restore being-received vouchers
+         {
+             ByteBuffer buf;
+@@ -542,7 +578,7 @@ namespace beam::wallet
+ 
+     void Wallet::DoInSyncedWallet(OnSyncAction&& action)
+     {
+-        bool bSynced = !SyncRemains() && IsNodeInSync();
++        bool bSynced = IsRecoveryAdmissionOpen() && !SyncRemains() && IsNodeInSync();
+ 
+         if (bSynced)
+         {
+@@ -683,7 +719,8 @@ namespace beam::wallet
+             { \
+                 MyRequest##type& x = static_cast<MyRequest##type&>(r); \
+                 get_ParentObj().DeleteReq(x); \
+-                get_ParentObj().OnRequestComplete(x); \
++                if ((!get_ParentObj().m_RecoveryPolicy || x.m_WalletEpoch == get_ParentObj().m_TransactionEpoch) && get_ParentObj().AllowRequest(x)) \
++                    get_ParentObj().OnRequestComplete(x); \
+             } \
+             break;
+ 
+@@ -1253,6 +1290,7 @@ namespace beam::wallet
+ 
+     void Wallet::OnWalletMessage(const WalletID& myID, const SetTxParameter& msg)
+     {
++        if (!IsRecoveryAdmissionOpen()) return;
+         if (memis0(&msg.m_TxID.front(), msg.m_TxID.size()))
+         {
+             // special command/request
+@@ -1349,7 +1387,7 @@ namespace beam::wallet
+     void Wallet::UpdateActiveTransaction(BaseTransaction::Ptr tx)
+     {
+         auto it = m_ActiveTransactions.find(tx->GetTxID());
+-        if (it != m_ActiveTransactions.end())
++        if (it != m_ActiveTransactions.end() && it->second.get() == tx.get())
+         {
+             tx->Update();
+         }
+@@ -1381,6 +1419,12 @@ namespace beam::wallet
+ 
+     void Wallet::OnRequestComplete(MyRequestKernel& r)
+     {
++        if (r.m_RecoveryProof)
++        {
++            // Recovery proof requests cannot call a transaction object or failure transition.
++            m_RecoveryProofHeights[r.m_TxID] = r.m_Res.m_Proof.empty() ? 0 : r.m_Res.m_Proof.m_State.get_Height();
++            return;
++        }
+         if (!r.m_Res.m_Proof.empty())
+             m_WalletDB->get_History().AddStates(&r.m_Res.m_Proof.m_State, 1); // why not?
+ 
+@@ -1577,6 +1621,9 @@ namespace beam::wallet
+             m_ShieldedCountCheckpoints.emplace(scanHeightInclusive - 1, shieldedOutputsBefore);
+         storage::setBlobVar(*m_WalletDB, kShieldedCountCheckpoints, m_ShieldedCountCheckpoints);
+         m_BodyBirthdayBoundary = recognitionHeightInclusive;
++        m_RecognitionRecovery.m_OriginalBirthday = recognitionHeightInclusive;
++        m_RecognitionRecovery.m_Boundary = recognitionHeightInclusive;
++        storage::setBlobVar(*m_WalletDB, RecognitionRecovery::Key, m_RecognitionRecovery);
+         storage::setVar(*m_WalletDB, kBodyBirthdayBoundary, m_BodyBirthdayBoundary);
+         m_LowerBodyBoundaryOnRollback = lowerRecognitionBoundaryOnRollback;
+         storage::setVar(*m_WalletDB, kLowerBodyBoundaryOnRollback, m_LowerBodyBoundaryOnRollback);
+@@ -1600,7 +1647,8 @@ namespace beam::wallet
+         if (!CheckHistoricalHeaderQuorum(r))
+             return;
+         const auto& state = r.m_vStates.front();
+-        r.m_callback(state.get_Height(), state.m_TimeStamp);
++        if (r.m_RecoveryCallback) r.m_RecoveryCallback(state);
++        else r.m_callback(state.get_Height(), state.m_TimeStamp);
+     }
+ 
+     void Wallet::OnRequestComplete(MyRequestAssetsListAt& r)
+@@ -1627,6 +1675,11 @@ namespace beam::wallet
+ 
+         void OnEvent(Height h, const proto::Event::Base& evt) override
+         {
++            if (m_Wallet.m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay)
++            {
++                m_Wallet.ProcessRecoveryEvent(h, evt);
++                return;
++            }
+             switch (evt.get_Type())
+             {
+             case proto::Event::Type::Utxo:
+@@ -1733,15 +1786,21 @@ namespace beam::wallet
+     {
+         if (r.m_RecoveryGeneration != m_BodyRequestGeneration)
+             return;
+-        if (!CheckBodyPackQuorum(r))
++        if (m_RecoveryPolicy && (r.m_StartHeight != GetEventsHeightNext() ||
++            r.m_Res.m_Bodies.size() > r.m_Msg.m_CountExtra.v + 1)) return;
++        if (!r.m_QuorumAccepted && !CheckBodyPackQuorum(r))
+             return;
++        r.m_QuorumAccepted = true;
++        if (!EnsureRecoveryCursor(r.m_StartHeight + r.m_Res.m_Bodies.size() - 1,
++            [this, held = MyRequestBodyPack::Ptr(&r)] { OnRequestComplete(*held); CheckSyncDone(); })) return;
+         auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
+         if (!walletDB)
+         {
+             ReportBodyQuorumFailure("Beam WalletDB cannot provide atomic body processing");
+             return;
+         }
+-        walletDB->FlushNow();
++        bool committed = false;
++        const auto previousRecovery = m_RecognitionRecovery;
+         const auto previousExtra = m_Extra;
+         const auto previousBlocksDone = m_BlocksDone;
+         const auto previousTreasuryHandled = m_IsTreasuryHandled;
+@@ -1751,8 +1810,10 @@ namespace beam::wallet
+         CountOnlyRecognizerHandler countOnlyHandler(ownerKdf);
+         NodeProcessor::Recognizer recognizer(h, m_Extra);
+         NodeProcessor::Recognizer countOnlyRecognizer(countOnlyHandler, m_Extra);
+-        try 
++        try
+         {
++            RecoveryCheckpoint("pack-before-batch");
++            walletDB->BeginRecoveryBatch();
+             Height startHeight = r.m_StartHeight;
+             for (const auto& b : r.m_Res.m_Bodies)
+             {
+@@ -1770,12 +1831,18 @@ namespace beam::wallet
+ 
+             PersistShieldedCountCheckpoints();
+             m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
+-            walletDB->FlushNow();
++            PersistRecognitionRecovery(startHeight - 1);
++            RecoveryCheckpoint("pack-before-commit");
++            walletDB->EndRecoveryBatch(true);
++            committed = true;
++            RecoveryCheckpoint("pack-after-commit");
+             RequestBodies(r.m_Msg.m_Block0.v, startHeight);
+         }
+         catch (const std::exception& error)
+         {
+-            walletDB->RollbackNow();
++            if (committed) { ReportBodyQuorumFailure(error.what()); return; }
++            walletDB->EndRecoveryBatch(false);
++            m_RecognitionRecovery = previousRecovery;
+             m_Extra = previousExtra;
+             m_BlocksDone = previousBlocksDone;
+             m_IsTreasuryHandled = previousTreasuryHandled;
+@@ -1790,15 +1857,21 @@ namespace beam::wallet
+     {
+         if (r.m_RecoveryGeneration != m_BodyRequestGeneration)
+             return;
+-        if (!CheckBodyQuorum(r))
++        if (m_RecoveryPolicy && (r.m_Height ? r.m_Height != GetEventsHeightNext() : m_IsTreasuryHandled))
++            return;
++        if (!r.m_QuorumAccepted && !CheckBodyQuorum(r))
+             return;
++        r.m_QuorumAccepted = true;
++        if (!EnsureRecoveryCursor(r.m_Height,
++            [this, held = MyRequestBody::Ptr(&r)] { OnRequestComplete(*held); CheckSyncDone(); })) return;
+         auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
+         if (!walletDB)
+         {
+             ReportBodyQuorumFailure("Beam WalletDB cannot provide atomic body processing");
+             return;
+         }
+-        walletDB->FlushNow();
++        bool committed = false;
++        const auto previousRecovery = m_RecognitionRecovery;
+         const auto previousExtra = m_Extra;
+         const auto previousBlocksDone = m_BlocksDone;
+         const auto previousTreasuryHandled = m_IsTreasuryHandled;
+@@ -1810,6 +1883,8 @@ namespace beam::wallet
+         NodeProcessor::Recognizer countOnlyRecognizer(countOnlyHandler, m_Extra);
+         try
+         {
++            RecoveryCheckpoint(r.m_Height ? "body-before-batch" : "treasury-before-batch");
++            walletDB->BeginRecoveryBatch();
+             if (r.m_Height == 0)
+             {
+                 if (!r.m_Res.m_Body.m_Eternal.empty())
+@@ -1833,7 +1908,12 @@ namespace beam::wallet
+                 SaveShieldedCountCheckpoint(0, previousExtra.m_ShieldedOutputs);
+                 PersistShieldedCountCheckpoints();
+                 m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
+-                walletDB->FlushNow();
++                storage::setNextEventHeight(*m_WalletDB, 1);
++                PersistRecognitionRecovery(0);
++                RecoveryCheckpoint("treasury-before-commit");
++                walletDB->EndRecoveryBatch(true);
++                committed = true;
++                RecoveryCheckpoint("treasury-after-commit");
+                 RequestBodies(0, 1);
+                 return;
+             }
+@@ -1846,7 +1926,11 @@ namespace beam::wallet
+             SaveShieldedCountCheckpoint(r.m_Height, previousExtra.m_ShieldedOutputs);
+             PersistShieldedCountCheckpoints();
+             m_WalletDB->set_ShieldedOuts(m_Extra.m_ShieldedOutputs);
+-            walletDB->FlushNow();
++            PersistRecognitionRecovery(r.m_Height);
++            RecoveryCheckpoint("body-before-commit");
++            walletDB->EndRecoveryBatch(true);
++            committed = true;
++            RecoveryCheckpoint("body-after-commit");
+ 
+             if (r.m_Height < r.m_Msg.m_Top.m_Number.v)
+             {
+@@ -1855,7 +1939,9 @@ namespace beam::wallet
+         }
+         catch (const std::exception& error)
+         {
+-            walletDB->RollbackNow();
++            if (committed) { ReportBodyQuorumFailure(error.what()); return; }
++            walletDB->EndRecoveryBatch(false);
++            m_RecognitionRecovery = previousRecovery;
+             m_Extra = previousExtra;
+             m_BlocksDone = previousBlocksDone;
+             m_IsTreasuryHandled = previousTreasuryHandled;
+@@ -2062,13 +2148,311 @@ namespace beam::wallet
+         MyRequestEnumHdrs::Ptr repeated(new MyRequestEnumHdrs);
+         repeated->m_Msg = request.m_Msg;
+         repeated->m_callback = request.m_callback;
++        repeated->m_RecoveryCallback = request.m_RecoveryCallback;
+         repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+         PostReqUnique(*repeated);
+         return false;
+     }
+ 
++#ifdef BEAM_SDK_KMP_TESTS
++    static thread_local std::function<void(const char*)> s_RecoveryCheckpoint;
++    void Wallet::SetRecoveryCheckpointForTests(std::function<void(const char*)> callback)
++    { s_RecoveryCheckpoint = std::move(callback); }
++#endif
++    void Wallet::RecoveryCheckpoint(const char* point)
++    {
++#ifdef BEAM_SDK_KMP_TESTS
++        if (s_RecoveryCheckpoint) s_RecoveryCheckpoint(point);
++#endif
++    }
++
++    bool Wallet::CanProcessTransaction(const BaseTransaction& tx) const
++    {
++        if (!m_RecoveryPolicy) return true;
++        auto it = m_ActiveTransactions.find(tx.GetTxID());
++        return m_RecoveryAdmission && tx.InstanceEpoch() == m_TransactionEpoch &&
++            it != m_ActiveTransactions.end() && it->second.get() == &tx;
++    }
++
++    bool Wallet::AllowRequest(const Request& request) const
++    {
++        if (!m_RecoveryPolicy || m_RecoveryAdmission) return true;
++        if (request.m_RecoveryProof && request.get_Type() == Request::Type::Kernel)
++            return m_RecoveryQuorumConfigured && m_RecoveryLiveTip && !m_RecoveryFailure;
++        switch (request.get_Type())
++        {
++        case Request::Type::Body:
++        case Request::Type::BodyPack:
++        case Request::Type::EnumHdrs:
++        case Request::Type::ShieldedOutputsAt:
++        case Request::Type::StateSummary:
++            return m_RecoveryQuorumConfigured && !m_RecoveryFailure;
++        default:
++            return false;
++        }
++    }
++
++    void Wallet::ConfigureRecoveryQuorum()
++    {
++        auto network = std::dynamic_pointer_cast<proto::FlyClient::NetworkStd>(m_NodeEndpoint);
++        if (!network) throw std::runtime_error("Recovery requires quorum network");
++        network->SetRecoveryQuorum(true);
++        std::weak_ptr<uint8_t> lifetime = m_RecoveryLifetime;
++        network->m_RequestAdmission = [this, lifetime](const Request& r) {
++            return !lifetime.expired() && r.m_WalletEpoch == m_TransactionEpoch && AllowRequest(r);
++        };
++        network->m_RequestEpoch = [this, lifetime] {
++            return lifetime.expired() ? UINT64_MAX : m_TransactionEpoch;
++        };
++        m_RecoveryQuorumConfigured = true;
++    }
++
++    void Wallet::RecordSnapshotImport(const Block::SystemState::Full& tip)
++    {
++        m_RecognitionRecovery.m_Snapshot = true;
++        m_RecognitionRecovery.m_HistoryComplete = false;
++        tip.get_ID(m_RecognitionRecovery.m_Import);
++        storage::setBlobVar(*m_WalletDB, RecognitionRecovery::Key, m_RecognitionRecovery);
++    }
++
++    void Wallet::CloseRecoveryAdmission()
++    {
++        if (!m_RecoveryPolicy) return;
++        m_RecoveryAdmission = false;
++        m_RecoveryLiveTip = false;
++        m_RecoveryProofsStarted = false;
++        m_RecoveryProofHeights.clear();
++        m_RecoveryLiveQuorum = {};
++        m_RecoveryLiveQuorumPending = false;
++        m_WaitingRecoveryCursor = false;
++        m_VerifiedRecoveryCursor = {};
++        m_HistoricalHeaderCandidate = boost::none;
++        m_HistoricalHeaderCandidatePeer = io::Address();
++        m_HistoricalHeaderQuorumRetries = 0;
++        std::dynamic_pointer_cast<WalletDB>(m_WalletDB)->SetSelectionAllowed(false);
++        ++m_TransactionEpoch;
++        for (auto& entry : m_ActiveTransactions) entry.second->Retire();
++        // Drop transaction-bearing requests before payload validation or callback invocation.
++#define DROP_RECOVERY_REQUEST(type) while (!m_Pending##type.empty()) DeleteReq(*m_Pending##type.begin());
++        WalletFlyClientRequests_All(DROP_RECOVERY_REQUEST)
++#undef DROP_RECOVERY_REQUEST
++        ResetBodyQuorumState();
++        m_ShieldedBoundaryCandidate = boost::none;
++        m_ShieldedBoundaryCandidatePeer = io::Address();
++        m_ShieldedBoundaryQuorumRetries = 0;
++    }
++
++    void Wallet::ResetRecognitionRecovery(bool ownBatch)
++    {
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        try
++        {
++            if (ownBatch) db->BeginRecoveryBatch();
++            // This is an index reset, never Rescan/resetCoins/clearTxParameters.
++            db->deleteEventsFrom(0);
++            m_BodyBirthdayBoundary = 0;
++            storage::setVar(*db, kBodyBirthdayBoundary, Height(0));
++            m_Extra.m_ShieldedOutputs = 0;
++            db->set_ShieldedOuts(0);
++            m_ShieldedCountCheckpoints.clear();
++            PersistShieldedCountCheckpoints();
++            storage::setNextEventHeight(*db, 0);
++            SetTreasuryHandled(false);
++            storage::setNeedToRequestBodies(*db, true);
++            m_RecognitionRecovery.m_Boundary = 0;
++            m_RecognitionRecovery.m_Cursor = {};
++            m_RecognitionRecovery.m_Phase = RecognitionRecovery::Replay;
++            storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
++            RecoveryCheckpoint("reset-before-commit");
++            if (ownBatch) db->EndRecoveryBatch(true);
++            ResetCommitmentsCache();
++        }
++        catch (...)
++        {
++            if (ownBatch) db->EndRecoveryBatch(false);
++            m_RecoveryFailure = true; // reopen the engine from the committed Reset marker
++            throw;
++        }
++    }
++
++    bool Wallet::EnsureRecoveryCursor(Height h, std::function<void()>&& resume)
++    {
++        if (!m_RecoveryPolicy || !h || m_VerifiedRecoveryCursor.m_Height == h) return true;
++        Block::SystemState::Full state;
++        if (m_WalletDB->get_History().get_At(state, h))
++        {
++            state.get_ID(m_VerifiedRecoveryCursor);
++            return true;
++        }
++        // The bounded local header cache may no longer contain a historical pack boundary.
++        // Authenticate that header through the existing two-peer historical-header path before
++        // committing the body, rather than labeling the target hash as the cursor block hash.
++        MyRequestEnumHdrs::Ptr request(new MyRequestEnumHdrs);
++        request->m_Msg.m_Height = h;
++        const auto generation = m_BodyRequestGeneration;
++        request->m_RecoveryCallback = [this, generation, resume = std::move(resume)](const Block::SystemState::Full& header) {
++            if (generation != m_BodyRequestGeneration || m_RecoveryFailure) return;
++            header.get_ID(m_VerifiedRecoveryCursor);
++            m_WaitingRecoveryCursor = false;
++            resume();
++        };
++        m_WaitingRecoveryCursor = true;
++        if (!PostReqUnique(*request)) ReportBodyQuorumFailure("Recovery cursor header request unavailable");
++        return false;
++    }
++
++    void Wallet::PersistRecognitionRecovery(Height h)
++    {
++        if (!m_RecoveryPolicy) return;
++        Block::SystemState::Full tip;
++        get_tip(tip);
++        tip.get_ID(m_RecognitionRecovery.m_Target);
++        m_RecognitionRecovery.m_Cursor = h ? m_VerifiedRecoveryCursor : HeightHash{};
++        storage::setBlobVar(*m_WalletDB, RecognitionRecovery::Key, m_RecognitionRecovery);
++    }
++
++    void Wallet::RebuildRecoveryTransactions()
++    {
++        for (auto& entry : m_ActiveTransactions) entry.second->Retire();
++        m_ActiveTransactions.clear(); // no terminal observer, resource release or journal mutation
++        m_NextTipTransactionToUpdate.clear();
++        for (const auto& tx : m_WalletDB->getTxHistory(TxType::ALL)) ResumeTransaction(tx);
++    }
++
++    bool Wallet::FinishRecognitionRecovery()
++    {
++        if (m_RecoveryAdmission) return true;
++        if (!m_RecoveryQuorumConfigured || !m_RecoveryLiveTip || m_RecoveryFailure ||
++            !m_IsTreasuryHandled || SyncRemains()) return false;
++        Block::SystemState::Full tip;
++        get_tip(tip);
++        if (!tip.get_Height() || !IsValidTimeStamp(tip.m_TimeStamp) ||
++            GetEventsHeightNext() <= tip.get_Height()) return false;
++        HeightHash live;
++        tip.get_ID(live);
++        if (m_RecoveryLiveQuorum != live)
++        {
++            if (!m_RecoveryLiveQuorumPending)
++            {
++                // Reopen/completion with no remaining bodies still requires two live peers.
++                // Configuration and a recent cached timestamp alone are not quorum evidence.
++                MyRequestEnumHdrs::Ptr request(new MyRequestEnumHdrs);
++                request->m_Msg.m_Height = live.m_Height;
++                request->m_RecoveryCallback = [this, live](const Block::SystemState::Full& header) {
++                    m_RecoveryLiveQuorumPending = false;
++                    HeightHash agreed;
++                    header.get_ID(agreed);
++                    if (agreed != live) { ReportBodyQuorumFailure("Recovery live header mismatch"); return; }
++                    m_RecoveryLiveQuorum = agreed;
++                    CheckSyncDone();
++                };
++                m_RecoveryLiveQuorumPending = true;
++                if (!PostReqUnique(*request)) ReportBodyQuorumFailure("Recovery live quorum unavailable");
++            }
++            return false;
++        }
++        if (!m_RecoveryProofsStarted)
++        {
++            m_RecoveryProofsStarted = true;
++            // Revalidate persisted kernels before opening selection or reconstructing builders.
++            // A partial/prepared transaction without a kernel continues under its same TxID later.
++            for (const auto& tx : m_WalletDB->getTxHistory(TxType::ALL))
++            {
++                Merkle::Hash kernel;
++                if (!tx.canResume() || !tx.GetParameter(TxParameterID::KernelID, kernel)) continue;
++                MyRequestKernel::Ptr request(new MyRequestKernel);
++                request->m_TxID = tx.m_txId;
++                request->m_Msg.m_ID = kernel;
++                request->m_RecoveryProof = true;
++                PostReqUnique(*request);
++            }
++            if (SyncRemains()) return false;
++        }
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        const auto before = m_RecognitionRecovery;
++        try
++        {
++            for (const auto& proof : m_RecoveryProofHeights)
++            {
++                if (proof.second)
++                    storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, proof.second, false);
++                else
++                    storage::setTxParameter(*db, proof.first, TxParameterID::KernelUnconfirmedHeight, tip.get_Height(), false);
++            }
++            if (m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay)
++            {
++                HeightHash id;
++                tip.get_ID(id);
++                if (id.m_Hash != m_RecognitionRecovery.m_Target.m_Hash ||
++                    m_RecognitionRecovery.m_Cursor.m_Height != id.m_Height) return false;
++                m_RecognitionRecovery.m_HistoryComplete = true;
++            }
++            m_RecognitionRecovery.m_Phase = RecognitionRecovery::Complete;
++            m_RecognitionRecovery.m_Generation = m_TransactionEpoch;
++            storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
++            RecoveryCheckpoint("complete-before-commit");
++            db->FlushNow();
++        }
++        catch (...)
++        {
++            db->RollbackNow(false);
++            m_RecognitionRecovery = before;
++            m_RecoveryFailure = true;
++            return false;
++        }
++        try { RecoveryCheckpoint("complete-after-commit"); }
++        catch (...) { m_RecoveryFailure = true; return false; }
++        m_RecoveryAdmission = true;
++        db->SetSelectionAllowed(true);
++        RebuildRecoveryTransactions();
++        return true;
++    }
++
++    void Wallet::ProcessRecoveryEvent(Height h, const proto::Event::Base& evt)
++    {
++        if (evt.get_Type() == proto::Event::Type::Utxo)
++        {
++            const auto& e = Cast::Up<const proto::Event::Utxo&>(evt);
++            auto cid = e.m_Cid;
++            if (!m_WalletDB->IsRecoveredMatch(cid, e.m_Commitment)) return;
++            Coin coin;
++            coin.m_ID = cid;
++            const bool exists = m_WalletDB->findCoin(coin);
++            const auto before = coin;
++            const bool add = (e.m_Flags & proto::Event::Flags::Add) != 0;
++            if (!exists && !add) throw std::runtime_error("Missing recovery input identity");
++            CacheCommitment(e.m_Commitment, e.m_Maturity, add);
++            if (add)
++            {
++                coin.m_confirmHeight = std::min(coin.m_confirmHeight, h);
++                coin.m_maturity = e.m_Maturity;
++            }
++            else coin.m_spentHeight = std::min(coin.m_spentHeight, h);
++            if (!exists || coin.m_confirmHeight != before.m_confirmHeight ||
++                coin.m_maturity != before.m_maturity || coin.m_spentHeight != before.m_spentHeight)
++                m_WalletDB->saveCoin(coin);
++        }
++        else if (evt.get_Type() == proto::Event::Type::Shielded)
++        {
++            const auto& e = Cast::Up<const proto::Event::Shielded&>(evt);
++            auto found = m_WalletDB->getShieldedCoin(e.m_CoinID.m_Key);
++            ShieldedCoin coin = found ? *found : ShieldedCoin{};
++            const auto before = coin;
++            if (!found) coin.m_CoinID = e.m_CoinID;
++            coin.m_TxoID = e.m_TxoID;
++            if (e.m_Flags & proto::Event::Flags::Add)
++                coin.m_confirmHeight = std::min(coin.m_confirmHeight, h);
++            else coin.m_spentHeight = std::min(coin.m_spentHeight, h);
++            if (!found || coin.m_TxoID != before.m_TxoID || coin.m_confirmHeight != before.m_confirmHeight ||
++                coin.m_spentHeight != before.m_spentHeight) m_WalletDB->saveShieldedCoin(coin);
++            // Deliberately no RestoreTransactionFromShieldedCoin: even partial TxIDs are immutable here.
++        }
++    }
++
+     void Wallet::ReportBodyQuorumFailure(const char* message)
+     {
++        CloseRecoveryAdmission();
++        m_RecoveryFailure = true;
+         storage::setNeedToRequestBodies(*m_WalletDB, true);
+         if (m_BodyQuorumFailureHandler)
+             m_BodyQuorumFailureHandler(message);
+@@ -2162,6 +2546,7 @@ namespace beam::wallet
+ 
+         size_t nOuts = 0;
+         der & nOuts;
++        if (nOuts > der.bytes_left()) throw std::runtime_error("Malformed recovery output count");
+         block.m_vOutputs.resize(nOuts);
+ 
+         for (size_t i = 0; i < nOuts; i++)
+@@ -2172,8 +2557,20 @@ namespace beam::wallet
+             yas::detail::loadRecovery(der, *pOut, h);
+         }
+ 
++        const size_t prefixSize = b.m_Perishable.size() - der.bytes_left();
++        Block::Body full;
++        der & Cast::Down<Block::BodyBase>(full) & Cast::Down<TxVectors::Perishable>(full);
++        if (der.bytes_left()) throw std::runtime_error("Trailing recovery body data");
++        Serializer canonical;
++        canonical & full.m_vInputs & full.m_vOutputs.size();
++        for (const auto& output : full.m_vOutputs) yas::detail::saveRecovery(canonical, *output, h);
++        auto encoded = canonical.buffer();
++        if (encoded.second != prefixSize || memcmp(encoded.first, b.m_Perishable.data(), prefixSize))
++            throw std::runtime_error("Inconsistent recovery body encoding");
++
+         der.reset(b.m_Eternal);
+         der & Cast::Down<TxVectors::Eternal>(block);
++        if (der.bytes_left()) throw std::runtime_error("Trailing recovery kernel data");
+         PreprocessBlock(block);
+ 
+         recognizer.m_Pos.m_Height = h;
+@@ -2261,6 +2658,7 @@ namespace beam::wallet
+ 
+     void Wallet::RequestBodies(Height currentHeight, Height startHeight)
+     {
++        if (m_WaitingRecoveryCursor) return;
+         if (!IsMobileNodeEnabled())
+             return;
+ 
+@@ -2290,8 +2688,9 @@ namespace beam::wallet
+             pReq->m_RecoveryGeneration = m_BodyRequestGeneration;
+             msg.m_CountExtra.v = hCountExtra;
+             msg.m_Block0.v = currentHeight;
+-            msg.m_HorizonLo1.v = newTip.get_Height() - count;
+-            msg.m_HorizonHi1.v = newTip.get_Height();
++            const bool complete = m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay;
++            msg.m_HorizonLo1.v = complete ? 0 : newTip.get_Height() - count;
++            msg.m_HorizonHi1.v = complete ? 0 : newTip.get_Height();
+ 
+             PostReqUnique(*pReq);
+         }
+@@ -2517,8 +2916,40 @@ namespace beam::wallet
+         RestoreTransactionFromShieldedCoin(*shieldedCoin);
+     }
+ 
++    void Wallet::OnRollingBack(Height firstRemoved)
++    {
++        if (!m_RecoveryPolicy) return;
++        CloseRecoveryAdmission();
++        InvalidateBodyRequestsAfterRollback();
++        RecoveryCheckpoint("before-marker");
++        struct Anchor : Block::SystemState::IHistory::IWalker
++        {
++            Height limit;
++            HeightHash id = {};
++            bool OnState(const Block::SystemState::Full& state) override
++            {
++                if (state.get_Height() >= limit) return true;
++                state.get_ID(id);
++                return false;
++            }
++        } anchor;
++        anchor.limit = firstRemoved;
++        m_WalletDB->get_History().Enum(anchor, nullptr);
++        m_RecognitionRecovery.m_Anchor = anchor.id;
++        m_RecognitionRecovery.m_RollbackPending = true;
++        m_RecognitionRecovery.m_Generation = m_TransactionEpoch;
++        if (m_RecognitionRecovery.m_Snapshot &&
++            (m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay ||
++             anchor.id.m_Height < m_RecognitionRecovery.m_Import.m_Height))
++            m_RecognitionRecovery.m_Phase = RecognitionRecovery::Reset;
++        storage::setBlobVar(*m_WalletDB, RecognitionRecovery::Key, m_RecognitionRecovery);
++        std::dynamic_pointer_cast<WalletDB>(m_WalletDB)->FlushNow();
++        RecoveryCheckpoint("after-marker");
++    }
++
+     void Wallet::OnRolledBack()
+     {
++        if (!m_RecognitionRecovery.m_RollbackPending) CloseRecoveryAdmission();
+         // Requests name a concrete old-branch tip. Invalidate them before mutating the durable
+         // recovery cursor so a late response cannot be accepted for the replacement chain.
+         InvalidateBodyRequestsAfterRollback();
+@@ -2530,6 +2961,24 @@ namespace beam::wallet
+         sTip.get_ID(id);
+         BEAM_LOG_INFO() << "Rolled back to " << id;
+ 
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        const bool replay = m_RecoveryPolicy && m_RecognitionRecovery.m_Snapshot &&
++            (m_RecognitionRecovery.m_Phase == RecognitionRecovery::Reset ||
++             m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay ||
++             id.m_Height < m_RecognitionRecovery.m_Import.m_Height);
++        try
++        {
++        if (replay)
++        {
++            m_RecognitionRecovery.m_Phase = RecognitionRecovery::Reset;
++            m_RecognitionRecovery.m_Generation = m_TransactionEpoch;
++            m_RecognitionRecovery.m_Anchor = id;
++            storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
++            if (!m_RecognitionRecovery.m_RollbackPending)
++                db->FlushNow(); // legacy/direct entry; FlyClient already committed its marker
++        }
++        if (m_RecoveryPolicy) db->BeginRecoveryBatch(false);
++
+         m_WalletDB->setSystemStateID(id);
+         m_WalletDB->get_History().DeleteFrom(id.m_Height + 1);
+         m_WalletDB->rollbackConfirmedUtxo(id.m_Height);
+@@ -2569,7 +3018,30 @@ namespace beam::wallet
+         {
+             SetEventsHeight(id.m_Height);
+         }
+-        RestoreShieldedCountAfterRollback(id.m_Height);
++        if (replay)
++            ResetRecognitionRecovery(false);
++        else
++        {
++            // A height/date birthday remains immutable provenance. Its effective boundary
++            // follows a fork crossing H, including when lower-on-rollback was originally false.
++            if (m_RecoveryPolicy && m_BodyBirthdayBoundary && id.m_Height + 1 < m_BodyBirthdayBoundary)
++                m_LowerBodyBoundaryOnRollback = true;
++            RestoreShieldedCountAfterRollback(id.m_Height);
++        }
++        if (m_RecoveryPolicy)
++        {
++            m_RecognitionRecovery.m_RollbackPending = false;
++            m_RecognitionRecovery.m_Boundary = m_BodyBirthdayBoundary;
++            storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
++            db->EndRecoveryBatch(true);
++        }
++        }
++        catch (...)
++        {
++            if (m_RecoveryPolicy) db->EndRecoveryBatch(false);
++            m_RecoveryFailure = true; // must reconstruct engine before retry
++            throw;
++        }
+     }
+ 
+     void Wallet::OnEventsSerif(const Hash::Value& hv, Height h)
+@@ -2675,6 +3147,20 @@ namespace beam::wallet
+ 
+     void Wallet::OnNewTip()
+     {
++        if (m_RecoveryPolicy && !m_RecoveryAdmission)
++        {
++            if (m_RecoveryLiveQuorumPending)
++            {
++                while (!m_PendingEnumHdrs.empty()) DeleteReq(*m_PendingEnumHdrs.begin());
++                m_RecoveryLiveQuorumPending = false;
++                m_HistoricalHeaderCandidate = boost::none;
++                m_HistoricalHeaderCandidatePeer = io::Address();
++            }
++            m_RecoveryProofsStarted = false;
++            m_RecoveryProofHeights.clear();
++            while (!m_PendingKernel.empty()) DeleteReq(*m_PendingKernel.begin());
++        }
++        m_RecoveryLiveTip = true;
+         m_WalletDB->ShrinkHistory();
+ 
+         Block::SystemState::Full sTip;
+@@ -2724,6 +3210,7 @@ namespace beam::wallet
+ 
+     void Wallet::OnTipUnchanged()
+     {
++        m_RecoveryLiveTip = true;
+         BEAM_LOG_INFO() << "Tip has not been changed";
+ 
+         RequestBodies();
+@@ -2821,7 +3308,11 @@ namespace beam::wallet
+ 
+         m_WalletDB->setSystemStateID(id);
+         BEAM_LOG_INFO() << "Current state is " << id;
++        // Header synchronization must remain observable while height/date bootstrap is waiting
++        // to start. SDK Ready/selection use the separate recovery admission predicate.
++        const bool recoveryReady = !m_RecoveryPolicy || FinishRecognitionRecovery();
+         NotifySyncProgress();
++        if (!recoveryReady) return;
+ 
+         if (!IsValidTimeStamp(sTip.m_TimeStamp))
+         {
+@@ -2895,6 +3386,7 @@ namespace beam::wallet
+ 
+     void Wallet::SendTransactionToNode(const TxID& txId, const Transaction::Ptr& data, const Merkle::Hash* pParentCtx, SubTxID subTxID)
+     {
++        if (!IsRecoveryAdmissionOpen()) return;
+         BEAM_LOG_DEBUG() << txId << "[" << subTxID << "]" << " sending tx for registration";
+ 
+         auto walletDB = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
+@@ -3146,6 +3638,7 @@ namespace beam::wallet
+ 
+     void Wallet::ProcessStoredMessages()
+     {
++        if (!IsRecoveryAdmissionOpen()) return;
+         if (m_MessageEndpoints.empty() || m_StoredMessagesProcessed)
+         {
+             return;
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index b7b6e04..b0c47cd 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -162,6 +162,12 @@ namespace beam::wallet
+         void Subscribe(ISimpleSwapHandler*);
+         void Unsubscribe(ISimpleSwapHandler*);
+         void ResumeAllTransactions();
++        bool RecoveryPolicyEnabled() const { return m_RecoveryPolicy; }
++        bool IsRecoveryAdmissionOpen() const { return !m_RecoveryPolicy || m_RecoveryAdmission; }
++        uint64_t TransactionEpoch() const { return m_TransactionEpoch; }
++        bool CanProcessTransaction(const BaseTransaction&) const;
++        void ConfigureRecoveryQuorum();
++        void RecordSnapshotImport(const Block::SystemState::Full&);
+         void VisitActiveTransaction(const TxVisitor& visitor);
+ 
+         void SetWidget(std::string&&, ByteBuffer&&);
+@@ -210,6 +216,8 @@ namespace beam::wallet
+             m_BodyQuorumFailureHandler = std::move(handler);
+         }
+ #ifdef BEAM_SDK_KMP_TESTS
++        friend class SnapshotReorgRecoveryTestAccess;
++        static void SetRecoveryCheckpointForTests(std::function<void(const char*)>);
+         ECC::Hash::Value BodyDigestForTests(const proto::Body& body) const {
+             return BodyDigest(body);
+         }
+@@ -279,6 +287,7 @@ namespace beam::wallet
+         void OnNewTip() override;
+         void OnTipUnchanged() override;
+         void OnRolledBack() override;
++        void OnRollingBack(Height firstRemoved) override;
+         void get_Kdf(Key::IKdf::Ptr&) override;
+         void get_OwnerKdf(Key::IPKdf::Ptr&) override;
+         Block::SystemState::IHistory& get_History() override;
+@@ -350,6 +359,29 @@ namespace beam::wallet
+         bool IsMobileNodeEnabled() const;
+     private:
+         std::thread::id _myThread;
++        RecognitionRecovery m_RecognitionRecovery;
++        bool m_RecoveryPolicy = false;
++        bool m_RecoveryAdmission = false;
++        bool m_RecoveryQuorumConfigured = false;
++        bool m_RecoveryFailure = false;
++        bool m_RecoveryLiveTip = false;
++        uint64_t m_TransactionEpoch = 0;
++        bool m_RecoveryProofsStarted = false;
++        std::map<TxID, Height> m_RecoveryProofHeights;
++        HeightHash m_RecoveryLiveQuorum = {};
++        bool m_RecoveryLiveQuorumPending = false;
++        std::shared_ptr<uint8_t> m_RecoveryLifetime = std::make_shared<uint8_t>(0);
++        void CloseRecoveryAdmission();
++        void ResetRecognitionRecovery(bool ownBatch = true);
++        void PersistRecognitionRecovery(Height);
++        bool FinishRecognitionRecovery();
++        void RebuildRecoveryTransactions();
++        bool AllowRequest(const Request&) const;
++        void ProcessRecoveryEvent(Height, const proto::Event::Base&);
++        bool EnsureRecoveryCursor(Height, std::function<void()>&&);
++        bool m_WaitingRecoveryCursor = false;
++        HeightHash m_VerifiedRecoveryCursor = {};
++        static void RecoveryCheckpoint(const char*);
+ 
+ // The following macros define
+ // Wallet to Node messages (requests) to get update on blockchain state
+@@ -417,16 +449,19 @@ namespace beam::wallet
+             struct EnumHdrs
+             {
+                 std::function<void(Height, Timestamp)> m_callback;
++                std::function<void(const Block::SystemState::Full&)> m_RecoveryCallback;
+             };
+             struct BodyPack
+             {
+                 Height m_StartHeight = MaxHeight;
+                 uint64_t m_RecoveryGeneration = 0;
++                bool m_QuorumAccepted = false;
+             };
+             struct Body
+             {
+                 Height m_Height = MaxHeight;
+                 uint64_t m_RecoveryGeneration = 0;
++                bool m_QuorumAccepted = false;
+             };
+ 
+             struct AssetsListAt
+@@ -467,8 +502,10 @@ namespace beam::wallet
+         } \
+         bool PostReq(MyRequest##type& x) \
+         { \
++            if (!AllowRequest(x)) return false; \
+             if (!m_NodeEndpoint) \
+                 return false; \
++            x.m_WalletEpoch = m_TransactionEpoch; \
+             AddReq(x); \
+             m_NodeEndpoint->PostRequest(x, m_RequestHandler); \
+              \
+diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
+index f21abb1..7facfa6 100644
+--- a/wallet/core/wallet_db.cpp
++++ b/wallet/core/wallet_db.cpp
+@@ -3164,6 +3164,8 @@ namespace beam::wallet
+ 
+     void WalletDB::selectCoins2(Height h, Amount nTrg, Asset::ID aid, std::vector<Coin>& vSelStd, std::vector<ShieldedCoin>& vSelShielded, uint32_t nMaxShielded, bool bCanReturnLess)
+     {
++        if (!m_SelectionAllowed)
++            throw std::runtime_error("Beam recovery admission deferred");
+         if (!nTrg)
+             return;
+ 
+@@ -3273,6 +3275,8 @@ namespace beam::wallet
+ 
+     vector<Coin> WalletDB::selectCoinsEx(Amount amount, Asset::ID assetId, bool bCanReturnLess)
+     {
++        if (!m_SelectionAllowed)
++            throw std::runtime_error("Beam recovery admission deferred");
+         vector<Coin> coins, coinsSel;
+         HeightHash stateID = {};
+         getSystemStateID(stateID);
+@@ -5451,6 +5455,12 @@ namespace beam::wallet
+ 
+     void WalletDB::insertEvent(Height h, const Blob& body, const Blob& key)
+     {
++        sqlite::Statement exists(this, "SELECT 1 FROM " EVENTS_NAME " WHERE Height=?1 AND Body=?2 AND Key=?3 LIMIT 1");
++        exists.bind(1, h);
++        exists.bind(2, body);
++        exists.bind(3, key);
++        if (exists.step())
++            return;
+         sqlite::Statement stm(this, "INSERT INTO " EVENTS_NAME "(" ENUM_EVENTS_FIELDS(LIST, COMMA, ) ") VALUES(" ENUM_EVENTS_FIELDS(BIND_LIST, COMMA, ) ");");
+         stm.bind(1, h);
+         stm.bind(2, body);
+@@ -5900,6 +5910,7 @@ namespace beam::wallet
+ 
+     void WalletDB::notifyCoinsChanged(ChangeAction action, const vector<Coin>& items)
+     {
++        if (m_RecoveryBatch) return;
+         if (items.empty() && action != ChangeAction::Reset)
+             return;
+ 
+@@ -5913,6 +5924,11 @@ namespace beam::wallet
+     {
+         if (items.empty() && action != ChangeAction::Reset)
+             return;
++        if (m_RecoveryBatch)
++        {
++            m_RecoveryBatchTransactionsChanged = true;
++            return;
++        }
+ 
+         for (const auto sub : m_subscribers)
+         {
+@@ -5922,11 +5938,13 @@ namespace beam::wallet
+ 
+     void WalletDB::notifySystemStateChanged(const HeightHash& stateID)
+     {
++        if (m_RecoveryBatch) return;
+         for (const auto sub : m_subscribers) sub->onSystemStateChanged(stateID);
+     }
+ 
+     void WalletDB::notifyAssetChanged(ChangeAction action, Asset::ID assetID)
+     {
++        if (m_RecoveryBatch) return;
+         for (const auto sub : m_subscribers) sub->onAssetChanged(action, assetID);
+     }
+ 
+@@ -5943,6 +5961,7 @@ namespace beam::wallet
+ 
+     void WalletDB::notifyShieldedCoinsChanged(ChangeAction action, const std::vector<ShieldedCoin>& items)
+     {
++        if (m_RecoveryBatch) return;
+         if (items.empty() && action != ChangeAction::Reset)
+             return;
+ 
+@@ -5952,6 +5971,36 @@ namespace beam::wallet
+         }
+     }
+ 
++    void WalletDB::EndRecoveryBatch(bool commit)
++    {
++        if (commit)
++            FlushNow(); // keep notifications suppressed if COMMIT throws
++        else
++            RollbackNow(false);
++        const bool transactionsChanged = m_RecoveryBatchTransactionsChanged;
++        m_RecoveryBatchTransactionsChanged = false;
++        m_RecoveryBatch = false;
++        if (commit)
++        {
++            // One failing observer must not suppress another observer or another reset.
++            const auto notify = [](auto&& callback) {
++                try { callback(); }
++                catch (...) { BEAM_LOG_ERROR() << "Recovery observer failed after commit"; }
++            };
++            for (const auto sub : m_subscribers)
++            {
++                notify([&] { sub->onCoinsChanged(ChangeAction::Reset, {}); });
++                notify([&] { sub->onShieldedCoinsChanged(ChangeAction::Reset, {}); });
++            }
++            if (transactionsChanged)
++                notify([&] {
++                    const auto transactions = getTxHistory(wallet::TxType::ALL, 0, std::numeric_limits<int>::max());
++                    for (const auto sub : m_subscribers)
++                        notify([&] { sub->onTransactionChanged(ChangeAction::Reset, transactions); });
++                });
++        }
++    }
++
+     Block::SystemState::IHistory& WalletDB::get_History()
+     {
+         return m_History;
+diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
+index 7104f9e..6aec8d1 100644
+--- a/wallet/core/wallet_db.h
++++ b/wallet/core/wallet_db.h
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ #pragma once
++#include <atomic>
+ 
+ #if defined(__clang__)
+ #  pragma clang diagnostic push
+@@ -662,6 +663,30 @@ namespace beam::wallet
+         struct Transaction;
+     }  // namespace sqlite
+ 
++    // Serialized in the encrypted WalletDB, alongside its identity/network. No separate ledger.
++    struct RecognitionRecovery
++    {
++        uint32_t m_Version = 1;
++        uint64_t m_Generation = 0;
++        enum Phase : uint32_t { None, Reset, Replay, Complete };
++        uint32_t m_Phase = None;
++        bool m_Snapshot = false;
++        bool m_HistoryComplete = false;
++        bool m_RollbackPending = false;
++        HeightHash m_Import = {};
++        HeightHash m_Anchor = {};
++        HeightHash m_Target = {};
++        HeightHash m_Cursor = {};
++        Height m_OriginalBirthday = 0;
++        Height m_Boundary = 0;
++        template <typename Archive> void serialize(Archive& ar)
++        {
++            ar & m_Version & m_Generation & m_Phase & m_Snapshot & m_HistoryComplete & m_RollbackPending
++                & m_Import & m_Anchor & m_Target & m_Cursor & m_OriginalBirthday & m_Boundary;
++        }
++        static constexpr const char* Key = "beam.sdk.kmp.recognition-recovery.v1";
++    };
++
+     class WalletDB : public IWalletDB
+     {
+     public:
+@@ -840,6 +865,14 @@ namespace beam::wallet
+         // the pending SQL transaction durable synchronously. The standard UI
+         // relies on its running flush timer and cannot provide this guarantee.
+         void FlushNow() { flushDB(); }
++        void SetSelectionAllowed(bool allowed) { m_SelectionAllowed = allowed; }
++        bool IsSelectionAllowed() const { return m_SelectionAllowed; }
++        void BeginRecoveryBatch(bool flushPending = true) {
++            if (flushPending) FlushNow();
++            m_RecoveryBatchTransactionsChanged = false;
++            m_RecoveryBatch = true;
++        }
++        void EndRecoveryBatch(bool commit);
+         void RollbackNow(bool notifyObservers = true) {
+             rollbackDB();
+             // A rolled-back body may already have populated the parameter cache and emitted
+@@ -862,6 +895,9 @@ namespace beam::wallet
+ #endif
+ 
+     private:
++        std::atomic<bool> m_SelectionAllowed{true};
++        bool m_RecoveryBatch = false;
++        bool m_RecoveryBatchTransactionsChanged = false;
+         static std::shared_ptr<WalletDB> initBase(const std::string& path, const SecString& password, bool separateDBForPrivateData);
+ 
+         void DeleteNonceAddresses();

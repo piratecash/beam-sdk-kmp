@@ -181,6 +181,9 @@ public sealed class BeamFailure(
 ) : Exception(message, cause) {
     public class Validation(message: String) : BeamFailure(message, retryable = false)
     public class InsufficientFunds(message: String) : BeamFailure(message, retryable = false)
+    /** Admission postponed by an unresolved outgoing transaction. Retry with the same operationId. */
+    public class SendAdmissionDeferred(message: String, cause: Throwable? = null) :
+        BeamFailure(message, cause, retryable = true)
     public class Node(message: String, cause: Throwable? = null) :
         BeamFailure(message, cause, retryable = true)
     public class Quorum(message: String) : BeamFailure(message, retryable = true)

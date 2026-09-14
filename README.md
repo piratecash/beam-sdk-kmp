@@ -85,6 +85,10 @@ submodules at their pinned revisions. The host/Android build scripts then compil
 # Also build the instrumented library and run native/JNI fixture regressions.
 BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-tests \
   BEAM_NATIVE_TESTS=1 ./scripts/build-native-host.sh
+BEAM_SNAPSHOT_REORG_FIXTURE="$PWD/.native-cache/build-host-tests/libbeam_sdk_kmp_snapshot_reorg_fixture.$([ "$(uname -s)" = Darwin ] && echo dylib || echo so)" \
+BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE=1 \
+BEAM_SEND_ADMISSION_FIXTURE="$PWD/.native-cache/build-host-tests/libbeam_sdk_kmp_send_admission_fixture.$([ "$(uname -s)" = Darwin ] && echo dylib || echo so)" \
+BEAM_EXPECT_SEND_ADMISSION_FIXTURE=1 \
 BEAM_EXPECT_NATIVE_TEST_FIXTURES=1 \
   ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest
 
@@ -93,6 +97,17 @@ BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-release ./scripts/build-native-ho
 
 ./scripts/fetch-android-dependencies.sh
 ANDROID_HOME=/path/to/android-sdk ./scripts/build-native-android.sh
+```
+
+On Windows PowerShell, the instrumented test command is:
+
+```powershell
+$env:BEAM_SNAPSHOT_REORG_FIXTURE = (Resolve-Path '.native-cache/build-host-tests/Release/beam_sdk_kmp_snapshot_reorg_fixture.dll').Path
+$env:BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE = '1'
+$env:BEAM_SEND_ADMISSION_FIXTURE = (Resolve-Path '.native-cache/build-host-tests/Release/beam_sdk_kmp_send_admission_fixture.dll').Path
+$env:BEAM_EXPECT_SEND_ADMISSION_FIXTURE = '1'
+$env:BEAM_EXPECT_NATIVE_TEST_FIXTURES = '1'
+./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest
 ```
 
 The Android build uses NDK `27.0.12077973`, API 27, static C++ runtime and 16 KiB ELF page
@@ -122,9 +137,9 @@ purpose are documented in the patch headers.
 ## Local checks
 
 Use JDK 21 for Gradle. `beam-sdk:desktopTest` also runs native load/create/reopen smoke tests, so
-build and stage the host library first as shown above. With a production native, the single
-fixture-only stopped-send test is reported as skipped; the instrumented commands above require and
-execute it instead of silently skipping it:
+build and stage the host library first as shown above. With a production native, fixture-only tests
+are reported as skipped; the instrumented commands above require and execute them instead of
+silently skipping them:
 
 ```shell
 ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest
@@ -152,3 +167,15 @@ The official-node integration test is opt-in because it performs external networ
 BEAM_LIVE_TEST=1 ./gradlew :beam-sdk:desktopTest \
   --tests cash.p.beam.NativeLiveSyncTest --rerun-tasks
 ```
+
+The mainnet snapshot restore test is also opt-in. Run it with JDK 21; it reads `words` and
+`beam.databaseKey` from the Git-ignored root `local.properties` through the generated demo config,
+creates a fresh temporary wallet, and uses the official default snapshot URL. Expect approximately
+352 MB of network traffic:
+
+```shell
+BEAM_LIVE_MAINNET_RESTORE=1 ./gradlew :sample-shared:desktopTest \
+  --tests cash.p.beam.sample.MainnetSnapshotRestoreLiveTest --rerun-tasks
+```
+
+This live mainnet test must not be enabled in the default CI test run.

@@ -399,9 +399,10 @@ private fun RestoreSource.logName(): String = when (this) {
     RestoreSource.FullScan -> "FullScan"
 }
 
-private fun Throwable.asBeamFailure(): BeamFailure {
+internal fun Throwable.asBeamFailure(): BeamFailure {
     if (this is CancellationException) throw this
     if (this is BeamFailure) return this
+    nativeFailure("SEND_ADMISSION_DEFERRED")?.let { return BeamFailure.SendAdmissionDeferred(it, this) }
     nativeFailure("VALIDATION")?.let { return BeamFailure.Validation(it) }
     nativeFailure("INSUFFICIENT_FUNDS")?.let { return BeamFailure.InsufficientFunds(it) }
     nativeFailure("STORAGE")?.let { return BeamFailure.Storage(it, this) }

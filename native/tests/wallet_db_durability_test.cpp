@@ -278,6 +278,7 @@ int main()
         fs::remove(databasePath.string() + "-journal");
         fs::remove(atomicCreationPath);
         fs::remove(atomicCreationPath.string() + "-journal");
+        std::cout << "WALLET_DB_DURABILITY_OK" << std::endl;
         return 0;
     }
     catch (const std::exception& error)

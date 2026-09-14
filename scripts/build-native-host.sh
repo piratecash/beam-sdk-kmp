@@ -67,6 +67,15 @@ if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
         exit 1
     fi
     "$test_binary"
+    for fixture in send_admission snapshot_reorg; do
+        build_target "beam_sdk_kmp_${fixture}_tests"
+        build_target "beam_sdk_kmp_${fixture}_fixture"
+        if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
+            "$build_dir/Release/beam_sdk_kmp_${fixture}_tests.exe"
+        else
+            "$build_dir/beam_sdk_kmp_${fixture}_tests"
+        fi
+    done
 fi
 
 destination="$repo_root/beam-sdk/prebuilt/desktop/native/$triple"

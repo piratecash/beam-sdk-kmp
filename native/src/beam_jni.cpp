@@ -114,6 +114,11 @@ enum class SendState {
     Submitted,
 };
 
+class SendAdmissionDeferred final : public std::runtime_error {
+public:
+    SendAdmissionDeferred() : std::runtime_error("Another Beam outgoing transaction is unresolved; retry the same operation after reconciliation") {}
+};
+
 struct SendRecord {
     std::string operationId;
     std::string txId;
@@ -972,6 +977,7 @@ public:
 
     std::string previewSend(const std::string& receiver, std::uint64_t amount, const std::string& comment) {
         return invoke<std::string>([this, receiver, amount, comment]() {
+            requireRecoveryAdmissionOnWalletThread();
             auto type = requireOneSidedAddress(receiver);
             CoinsSelectionInfo selection;
             selection.m_requestedSum = amount;
@@ -1000,68 +1006,124 @@ public:
         std::int64_t previewVersion
     ) {
         return invoke<std::string>([this, operationId, receiver, amount, comment, previewVersion]() {
-            SendRecord existing;
-            if (loadSendRecord(*database_, operationId, existing)) {
-                auto expected = requestDigest(receiver, amount, comment, existing.fee);
-                if (existing.requestHash != expected.second) {
-                    throw std::logic_error("operationId is already bound to another send request");
-                }
-                return Json({{"transactionId", existing.txId}}).dump();
-            }
-            std::string activeOperation;
-            if (getRawString(*database_, kActiveSendVar, activeOperation) && !activeOperation.empty()) {
-                throw std::logic_error("Another Beam send operation is unresolved");
-            }
-            auto preview = previewMaterial(receiver, amount, comment);
-            if (preview.first != previewVersion) throw std::logic_error("Send preview is stale");
-            SendRecord record;
-            record.operationId = operationId;
-            record.txId = txIdString(beam::wallet::GenerateTxID());
-            record.receiver = receiver;
-            record.amount = amount;
-            record.comment = comment;
-            record.fee = previewFee(receiver, amount);
-            record.previewVersion = previewVersion;
-            record.requestHash = preview.second;
-            record.state = SendState::Prepared;
-            saveSendRecord(*database_, record);
-            setRawString(*database_, kActiveSendVar, operationId);
-            flushDatabase(database_);
-            return Json({{"transactionId", record.txId}}).dump();
+            return prepareSendOnWalletThread(operationId, receiver, amount, comment, previewVersion);
         });
     }
 
     std::string commitSend(const std::string& operationId) {
-        return invoke<std::string>([this, operationId]() {
-            SendRecord record;
-            if (!loadSendRecord(*database_, operationId, record)) return sendResolution("NotPrepared").dump();
-            if (record.state == SendState::Prepared) {
-                record.state = SendState::Committing;
-                saveSendRecord(*database_, record);
-                flushDatabase(database_);
-            }
-            if (record.state == SendState::Committing) {
-                auto txId = parseTxId(record.txId);
-                if (!database_->getTx(txId)) {
-                    auto wallet = client_->getWallet();
-                    if (!wallet) throw std::runtime_error("Beam wallet engine is not available");
-                    auto startedTxId = wallet->StartTransaction(makeSendParameters(record));
-                    if (startedTxId != txId || !database_->getTx(txId)) {
-                        throw std::runtime_error("Beam Core did not durably create the prepared transaction");
-                    }
-                    // Patched Core durably persists this stable TxID and immutable parameters
-                    // before any reservation or node submission. Therefore a missing row means
-                    // no payment side effect occurred and replay remains exactly-once.
-                    flushDatabase(database_);
-                }
-                record.state = SendState::Submitted;
-                saveSendRecord(*database_, record);
-                flushDatabase(database_);
-            }
-            return resolveSendOnWalletThread(record).dump();
+        return invokeWithClient<std::string>([this, operationId](const auto& client) {
+            return commitSendOnWalletThread(operationId, client->getWallet());
         });
     }
 
+private:
+#ifdef BEAM_SDK_KMP_TESTS
+    friend class SendAdmissionFixture;
+    unsigned int startTransactionCallsForTests_ = 0;
+    std::function<void()> invokeQueuedForTests_;
+#endif
+
+    // These helpers, including the history read and first Core side effect, execute in
+    // one owner-thread call. Core rollback cannot interleave with admission.
+    std::string prepareSendOnWalletThread(
+        const std::string& operationId, const std::string& receiver,
+        std::uint64_t amount, const std::string& comment, std::int64_t previewVersion
+    ) {
+        SendRecord existing;
+        if (loadSendRecord(*database_, operationId, existing)) {
+            auto expected = requestDigest(receiver, amount, comment, existing.fee);
+            if (existing.requestHash != expected.second) {
+                throw std::logic_error("operationId is already bound to another send request");
+            }
+            return Json({{"transactionId", existing.txId}}).dump();
+        }
+        requireSendAdmissionOnWalletThread(operationId);
+        auto preview = previewMaterial(receiver, amount, comment);
+        if (preview.first != previewVersion) throw std::logic_error("Send preview is stale");
+        SendRecord record;
+        record.operationId = operationId;
+        record.txId = txIdString(beam::wallet::GenerateTxID());
+        record.receiver = receiver;
+        record.amount = amount;
+        record.comment = comment;
+        record.fee = previewFee(receiver, amount);
+        record.previewVersion = previewVersion;
+        record.requestHash = preview.second;
+        record.state = SendState::Prepared;
+        saveSendRecord(*database_, record);
+        setRawString(*database_, kActiveSendVar, operationId);
+        flushDatabase(database_);
+        return Json({{"transactionId", record.txId}}).dump();
+    }
+
+    std::string commitSendOnWalletThread(const std::string& operationId, const Wallet::Ptr& wallet) {
+        SendRecord record;
+        if (!loadSendRecord(*database_, operationId, record)) return sendResolution("NotPrepared").dump();
+        if (record.state == SendState::Prepared || record.state == SendState::Committing) {
+            requireRecoveryAdmissionOnWalletThread();
+        }
+        const auto txId = parseTxId(record.txId);
+        const bool hasCoreRow = static_cast<bool>(database_->getTx(txId));
+        if (!hasCoreRow && (record.state == SendState::Prepared || record.state == SendState::Committing)) {
+            // Deferred retries leave the durable journal byte-for-byte unchanged,
+            // including Prepared before its Committing durability fence.
+            requireSendAdmissionOnWalletThread(operationId, &txId);
+        }
+        if (record.state == SendState::Prepared) {
+            record.state = SendState::Committing;
+            saveSendRecord(*database_, record);
+            flushDatabase(database_);
+        }
+        if (record.state == SendState::Committing) {
+            if (!hasCoreRow) {
+                if (!wallet) throw std::runtime_error("Beam wallet engine is not available");
+#ifdef BEAM_SDK_KMP_TESTS
+                ++startTransactionCallsForTests_;
+#endif
+                auto startedTxId = wallet->StartTransaction(makeSendParameters(record));
+                if (startedTxId != txId || !database_->getTx(txId)) {
+                    throw std::runtime_error("Beam Core did not durably create the prepared transaction");
+                }
+                // Patched Core durably persists this stable TxID and immutable parameters
+                // before any reservation or node submission. Therefore a missing row means
+                // no payment side effect occurred and replay remains exactly-once.
+                flushDatabase(database_);
+            }
+            record.state = SendState::Submitted;
+            saveSendRecord(*database_, record);
+            flushDatabase(database_);
+        }
+        return resolveSendOnWalletThread(record).dump();
+    }
+
+    void requireRecoveryAdmissionOnWalletThread() {
+        auto database = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+        if (!database || !database->IsSelectionAllowed()) throw SendAdmissionDeferred();
+    }
+
+    void requireSendAdmissionOnWalletThread(const std::string& operationId, const TxID* ownTxId = nullptr) {
+        requireRecoveryAdmissionOnWalletThread();
+        // The marker is only a journal hint: resolveSend clears it at Terminal,
+        // but a later Core rollback can reactivate that very same outgoing TxID.
+        for (const auto& transaction : database_->getTxHistory(TxType::ALL)) {
+            if (transaction.m_sender && (!ownTxId || transaction.m_txId != *ownTxId) &&
+                !isTerminal(transaction.m_status)) {
+                throw SendAdmissionDeferred();
+            }
+        }
+        std::string activeOperation;
+        if (getRawString(*database_, kActiveSendVar, activeOperation) &&
+            !activeOperation.empty() && activeOperation != operationId) {
+            SendRecord active;
+            if (!loadSendRecord(*database_, activeOperation, active)) throw SendAdmissionDeferred();
+            const auto transaction = database_->getTx(parseTxId(active.txId));
+            // A stale terminal marker need not prevent admission. Missing Core evidence
+            // (including Prepared/Committing) remains unresolved, never silently cleared.
+            if (!transaction || !isTerminal(transaction->m_status)) throw SendAdmissionDeferred();
+        }
+    }
+
+public:
     std::string resolveSend(const std::string& operationId) {
         return invokeOrUseStoppedDatabase<std::string>([this, operationId]() {
             SendRecord record;
@@ -1304,10 +1366,11 @@ public:
 
 private:
     bool canReportReadyLocked() const {
+        const auto database = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
         return !recoveryQuorumFailed_ && !bootstrapFailed_ && !bootstrapPending_ &&
             !bootstrapBodyScanPending_ && !snapshotImportPending_ &&
             initialStatusLoaded_ && initialTransactionsLoaded_ &&
-            connected_ && client_ && client_->isSynced();
+            connected_ && client_ && client_->isSynced() && database && database->IsSelectionAllowed();
     }
 
     void maybeReportReadyLocked() {
@@ -1420,6 +1483,7 @@ private:
             // ImportRecovery updates WalletDB after Wallet was constructed. Seed both Wallet's
             // in-memory shielded counter and its durable reorg checkpoint at the imported tip
             // before any post-snapshot body can be recognized.
+            wallet->RecordSnapshotImport(importedTip);
             wallet->StartBodyRequestsAt(
                 snapshotHeight + 1,
                 database_->get_ShieldedOuts(),
@@ -1456,6 +1520,13 @@ private:
 
     template <typename T, typename Function>
     T invoke(Function&& function) {
+        return invokeWithClient<T>([call = std::forward<Function>(function)](const auto&) mutable {
+            return call();
+        });
+    }
+
+    template <typename T, typename Function>
+    T invokeWithClient(Function&& function) {
         std::shared_ptr<BridgeWalletClient> client;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1469,10 +1540,15 @@ private:
         auto promise = std::make_shared<std::promise<Result>>();
         auto future = promise->get_future();
         client->getAsync()->makeIWTCall(
-            [call = std::forward<Function>(function)]() mutable -> boost::any {
+            [weakClient = std::weak_ptr<BridgeWalletClient>(client),
+             call = std::forward<Function>(function)]() mutable -> boost::any {
                 Result result;
                 try {
-                    result.value = std::make_shared<T>(call());
+                    // The invoking stack retains the selected client while waiting,
+                    // even after stop() moves client_. The queue must not own it.
+                    auto executingClient = weakClient.lock();
+                    if (!executingClient) throw std::logic_error("Beam wallet is not running");
+                    result.value = std::make_shared<T>(call(executingClient));
                 } catch (...) {
                     result.error = std::current_exception();
                 }
@@ -1482,6 +1558,9 @@ private:
                 promise->set_value(boost::any_cast<const Result&>(value));
             }
         );
+#ifdef BEAM_SDK_KMP_TESTS
+        if (invokeQueuedForTests_) invokeQueuedForTests_();
+#endif
         if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
             throw std::runtime_error("Timed out waiting for Beam owner thread");
         }
@@ -2011,7 +2090,9 @@ void throwJava(JNIEnv* environment, const std::exception& error) {
     const std::string detail = error.what();
     const char* className = "java/lang/IllegalStateException";
     const char* code = "NATIVE";
-    if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr ||
+    if (dynamic_cast<const SendAdmissionDeferred*>(&error) != nullptr) {
+        code = "SEND_ADMISSION_DEFERRED";
+    } else if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr ||
         dynamic_cast<const std::overflow_error*>(&error) != nullptr) {
         className = "java/lang/IllegalArgumentException";
         code = "VALIDATION";
