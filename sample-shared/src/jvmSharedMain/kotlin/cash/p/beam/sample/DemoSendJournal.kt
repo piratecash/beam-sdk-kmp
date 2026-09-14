@@ -149,4 +149,77 @@ internal actual object DemoWalletStorage {
 
     actual fun recoveryPath(storagePath: String, recoveryId: String): String =
         Paths.get(storagePath).resolve("recovery").resolve(recoveryId).toString()
+
+    actual fun loadSelectedWallet(
+        journalRoot: String,
+        configuredBase: ActiveWalletIdentity,
+    ): ActiveWalletIdentity? {
+        val marker = selectedWalletMarker(journalRoot)
+        if (!Files.exists(marker)) return null
+        require(Files.isRegularFile(marker)) { "Invalid Beam selected wallet marker" }
+        val lines = String(Files.readAllBytes(marker), StandardCharsets.US_ASCII).trim().lines()
+        require(lines.size == 5 && lines[0] == SELECTION_FORMAT_VERSION) {
+            "Invalid Beam selected wallet marker"
+        }
+        val base = ActiveWalletIdentity(parseNetwork(lines[1]), decodePath(lines[2]))
+        val selected = ActiveWalletIdentity(parseNetwork(lines[3]), decodePath(lines[4]))
+        return selected.takeIf { base == configuredBase }
+    }
+
+    @Synchronized
+    actual fun saveSelectedWallet(
+        journalRoot: String,
+        configuredBase: ActiveWalletIdentity,
+        selected: ActiveWalletIdentity,
+    ) {
+        require(configuredBase.storagePath.isNotBlank() && selected.storagePath.isNotBlank()) {
+            "Wallet storage path must not be blank"
+        }
+        val marker = selectedWalletMarker(journalRoot)
+        val temporary = marker.resolveSibling("${marker.fileName}.tmp")
+        val contents = listOf(
+            SELECTION_FORMAT_VERSION,
+            configuredBase.network.name,
+            encodePath(configuredBase.storagePath),
+            selected.network.name,
+            encodePath(selected.storagePath),
+        ).joinToString("\n").toByteArray(StandardCharsets.US_ASCII)
+        Files.createDirectories(marker.parent)
+        try {
+            FileChannel.open(
+                temporary,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE,
+            ).use { channel ->
+                val buffer = ByteBuffer.wrap(contents)
+                while (buffer.hasRemaining()) channel.write(buffer)
+                channel.force(true)
+            }
+            try {
+                Files.move(temporary, marker, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporary, marker, StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    private fun selectedWalletMarker(journalRoot: String): Path =
+        Paths.get(journalRoot).resolve(".demo-selected-wallet")
+
+    private fun parseNetwork(value: String): cash.p.beam.BeamNetwork =
+        cash.p.beam.BeamNetwork.entries.firstOrNull { it.name == value }
+            ?: error("Invalid Beam selected wallet marker network")
+
+    private fun encodePath(value: String): String = Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(value.toByteArray(StandardCharsets.UTF_8))
+
+    private fun decodePath(value: String): String =
+        String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8).also {
+            require(it.isNotBlank()) { "Invalid Beam selected wallet marker path" }
+        }
+
+    private const val SELECTION_FORMAT_VERSION = "beam-demo-wallet-v1"
 }

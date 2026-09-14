@@ -106,6 +106,7 @@ internal class BeamDemoController(
     initialState: DemoState = DemoState(storagePath = initialStoragePath),
 ) {
     private val sendJournalRoot = initialStoragePath
+    private val configuredBase = ActiveWalletIdentity(initialState.network, initialState.storagePath.trim())
 
     private data class BoundSession(
         val wallet: BeamWalletSession,
@@ -161,27 +162,38 @@ internal class BeamDemoController(
         input.withDatabaseKey { databaseKey -> walletFactory.openExisting(config, databaseKey) }
     }
 
-    fun openOrCreate() = launchWalletAction(
-        actionName = "auto-open-or-create",
-        requiresSeed = { _, targetPath -> !walletExists(targetPath) },
-    ) { input, config ->
-        if (walletExists(config.storagePath)) {
-            logger.i { "auto initialization selected existing ${input.network.name} wallet" }
-            input.withDatabaseKey { databaseKey -> walletFactory.openExisting(config, databaseKey) }
-        } else {
-            logger.i { "auto initialization selected new ${input.network.name} wallet" }
-            input.withCredentials { seed, databaseKey ->
-                walletFactory.createNew(config, seed, databaseKey)
+    fun openOrCreate() {
+        var selected: ActiveWalletIdentity? = null
+        launchWalletAction(
+            actionName = "auto-open-or-create",
+            targetIdentity = { input ->
+                DemoWalletStorage.loadSelectedWallet(sendJournalRoot, configuredBase).also { selected = it }
+                    ?: ActiveWalletIdentity(input.network, input.storagePath.trim())
+            },
+            requiresSeed = { _, targetPath -> selected == null && !walletExists(targetPath) },
+        ) { input, config ->
+            if (selected != null) {
+                check(walletExists(config.storagePath)) { "The selected Beam wallet database is missing" }
+                logger.i { "auto initialization selected saved ${input.network.name} wallet" }
+                input.withDatabaseKey { databaseKey -> walletFactory.openExisting(config, databaseKey) }
+            } else if (walletExists(config.storagePath)) {
+                logger.i { "auto initialization selected existing ${input.network.name} wallet" }
+                input.withDatabaseKey { databaseKey -> walletFactory.openExisting(config, databaseKey) }
+            } else {
+                logger.i { "auto initialization selected new ${input.network.name} wallet" }
+                input.withCredentials { seed, databaseKey ->
+                    walletFactory.createNew(config, seed, databaseKey)
+                }
             }
         }
     }
 
     fun restoreHeight() = launchWalletAction(
         actionName = "restore-height",
-        targetStoragePath = { input ->
+        targetIdentity = { input ->
             val height = input.restoreHeight.toLongOrNull()?.takeIf { it >= 0 }
                 ?: error("Enter a valid restore height")
-            DemoWalletStorage.recoveryPath(input.storagePath, "height-$height")
+            ActiveWalletIdentity(input.network, DemoWalletStorage.recoveryPath(input.storagePath, "height-$height"))
         },
         requiresSeed = { _, targetPath -> !walletExists(targetPath) },
     ) { input, config ->
@@ -191,9 +203,9 @@ internal class BeamDemoController(
 
     fun restoreDate() = launchWalletAction(
         actionName = "restore-date",
-        targetStoragePath = { input ->
+        targetIdentity = { input ->
             val date = LocalDate.parse(input.restoreDate)
-            DemoWalletStorage.recoveryPath(input.storagePath, "date-$date")
+            ActiveWalletIdentity(input.network, DemoWalletStorage.recoveryPath(input.storagePath, "date-$date"))
         },
         requiresSeed = { _, targetPath -> !walletExists(targetPath) },
     ) { input, config ->
@@ -202,7 +214,9 @@ internal class BeamDemoController(
 
     fun restoreFull() = launchWalletAction(
         actionName = "restore-full",
-        targetStoragePath = { input -> DemoWalletStorage.recoveryPath(input.storagePath, "full") },
+        targetIdentity = { input ->
+            ActiveWalletIdentity(input.network, DemoWalletStorage.recoveryPath(input.storagePath, "full"))
+        },
         requiresSeed = { _, targetPath -> !walletExists(targetPath) },
     ) { input, config ->
         input.restoreOrOpen(config, RestoreSource.FullScan)
@@ -210,10 +224,10 @@ internal class BeamDemoController(
 
     fun restoreSnapshot() = launchWalletAction(
         actionName = "restore-snapshot",
-        targetStoragePath = { input ->
+        targetIdentity = { input ->
             val source = input.snapshotRestoreSource()
             val suffix = source.expectedSha256?.lowercase()?.take(12) ?: "official"
-            DemoWalletStorage.recoveryPath(input.storagePath, "snapshot-$suffix")
+            ActiveWalletIdentity(input.network, DemoWalletStorage.recoveryPath(input.storagePath, "snapshot-$suffix"))
         },
         requiresSeed = { _, targetPath -> !walletExists(targetPath) },
     ) { input, config ->
@@ -351,7 +365,9 @@ internal class BeamDemoController(
 
     private fun launchWalletAction(
         actionName: String,
-        targetStoragePath: (DemoState) -> String = { it.storagePath.trim() },
+        targetIdentity: (DemoState) -> ActiveWalletIdentity = {
+            ActiveWalletIdentity(it.network, it.storagePath.trim())
+        },
         requiresSeed: (DemoState, String) -> Boolean = { _, _ -> false },
         createSession: suspend (DemoState, BeamSdkConfig) -> BeamWalletSession,
     ) {
@@ -361,12 +377,15 @@ internal class BeamDemoController(
             var unboundWallet: BeamWalletSession? = null
             try {
                 val requestedInput = mutableState.value
-                val requestedPath = targetStoragePath(requestedInput).also {
-                    require(it.isNotBlank()) { "Wallet storage path must not be blank" }
-                }
-                val requestedIdentity = ActiveWalletIdentity(requestedInput.network, requestedPath)
                 val previous = session
                 val pendingSend = DemoSendJournal.load(sendJournalRoot, requestedInput.network)
+                val resumePendingSend = previous == null && pendingSend != null
+                val requestedIdentity = if (resumePendingSend) {
+                    requireNotNull(pendingSend).owner
+                } else {
+                    targetIdentity(requestedInput)
+                }
+                require(requestedIdentity.storagePath.isNotBlank()) { "Wallet storage path must not be blank" }
                 if (previous != null && pendingSend != null) {
                     check(previous.identity == pendingSend.owner) {
                         "The unresolved Beam send belongs to another wallet database"
@@ -375,17 +394,8 @@ internal class BeamDemoController(
                         "Resolve the pending Beam send before switching wallet databases"
                     }
                 }
-                val resumePendingSend = previous == null && pendingSend != null
-                val input = if (resumePendingSend) {
-                    requestedInput.copy(network = requireNotNull(pendingSend).owner.network)
-                } else {
-                    requestedInput
-                }
-                val targetPath = if (resumePendingSend) {
-                    requireNotNull(pendingSend).owner.storagePath
-                } else {
-                    requestedPath
-                }
+                val input = requestedInput.copy(network = requestedIdentity.network)
+                val targetPath = requestedIdentity.storagePath
                 input.validateCredentials(
                     seedRequired = !resumePendingSend && requiresSeed(input, targetPath),
                 )
@@ -424,7 +434,9 @@ internal class BeamDemoController(
                                     databaseKey,
                                 )
                             }
+                            unboundWallet = reopened
                             val restored = installSession(reopened, previous.identity, input)
+                            unboundWallet = null
                             if (hostIsForeground && wantsRunning) restored.wallet.start()
                             logger.w { "wallet action=$actionName failed; previous wallet reopened" }
                         } catch (rollbackError: Throwable) {
@@ -461,6 +473,9 @@ internal class BeamDemoController(
         identity: ActiveWalletIdentity,
         input: DemoState,
     ): BoundSession {
+        // The selection also records an in-progress restore: a snapshot downloads during start(),
+        // so a process restart must reopen this database and resume it instead of showing the old balance.
+        DemoWalletStorage.saveSelectedWallet(sendJournalRoot, configuredBase, identity)
         val active = BoundSession(wallet, identity)
         session = active
         mutableState.update { it.copy(activeWallet = active.identity) }
@@ -707,4 +722,6 @@ internal expect object DemoSendJournal {
 internal expect object DemoWalletStorage {
     fun walletExists(storagePath: String): Boolean
     fun recoveryPath(storagePath: String, recoveryId: String): String
+    fun loadSelectedWallet(journalRoot: String, configuredBase: ActiveWalletIdentity): ActiveWalletIdentity?
+    fun saveSelectedWallet(journalRoot: String, configuredBase: ActiveWalletIdentity, selected: ActiveWalletIdentity)
 }

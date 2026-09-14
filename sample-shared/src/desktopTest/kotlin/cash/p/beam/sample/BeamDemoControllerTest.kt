@@ -90,6 +90,167 @@ class BeamDemoControllerTest {
     }
 
     @Test
+    fun openOrCreate_reopensSelectedRecoveryDatabaseAfterRestart() = runBlocking {
+        val directory = createTempDirectory("beam-demo-reopen-recovery")
+        val recoveryPath = directory.resolve("recovery/height-12345").toString()
+        val existingPaths = mutableSetOf(directory.toString())
+        val firstFactory = FakeDemoWalletFactory(FakeDemoSession(blockFirstStart = false))
+        val first = BeamDemoController(
+            directory.toString(),
+            firstFactory,
+            walletExists = { it in existingPaths },
+        )
+        try {
+            first.edit { copy(seedHex = "01".repeat(64), databaseKeyHex = "02".repeat(32)) }
+            first.openOrCreate()
+            withTimeout(5_000) { first.state.first { it.walletState is BeamWalletState.Ready && !it.busy } }
+            first.edit { copy(restoreHeight = "12345") }
+            first.restoreHeight()
+            withTimeout(5_000) { first.state.first { it.activeWallet?.storagePath == recoveryPath && !it.busy } }
+            existingPaths.add(recoveryPath)
+            first.closeAndJoin()
+
+            val secondFactory = FakeDemoWalletFactory(FakeDemoSession(blockFirstStart = false))
+            val second = BeamDemoController(
+                directory.toString(),
+                secondFactory,
+                walletExists = { it in existingPaths },
+            )
+            try {
+                second.edit { copy(databaseKeyHex = "02".repeat(32)) }
+                second.openOrCreate()
+                val reopened = withTimeout(5_000) {
+                    second.state.first { it.activeWallet?.storagePath == recoveryPath && it.walletState is BeamWalletState.Ready && !it.busy }
+                }
+                assertEquals(ActiveWalletIdentity(BeamNetwork.Testnet, recoveryPath), reopened.activeWallet)
+                assertEquals(BeamSdkConfig(BeamNetwork.Testnet, recoveryPath), secondFactory.lastOpenConfig)
+                assertEquals(1, secondFactory.openCalls)
+                assertEquals(0, secondFactory.createCalls)
+                assertEquals(0, secondFactory.restoreCalls)
+            } finally {
+                second.closeAndJoin()
+            }
+        } finally {
+            first.closeAndJoin()
+            deleteTree(directory)
+        }
+    }
+
+    @Test
+    fun openOrCreate_resumesSnapshotSelectionAfterRestartDuringDownload() = runBlocking {
+        val directory = createTempDirectory("beam-demo-resume-snapshot")
+        val recoveryPath = directory.resolve("recovery/snapshot-official").toString()
+        val baseSession = FakeDemoSession(blockFirstStart = false)
+        val downloadingSession = FakeDemoSession()
+        val first = BeamDemoController(
+            directory.toString(),
+            FakeDemoWalletFactory(baseSession, restoredSession = downloadingSession),
+            walletExists = { it == directory.toString() },
+        )
+        try {
+            first.edit { copy(seedHex = "01".repeat(64), databaseKeyHex = "02".repeat(32)) }
+            first.openOrCreate()
+            withTimeout(5_000) { first.state.first { it.walletState is BeamWalletState.Ready && !it.busy } }
+            first.restoreSnapshot()
+            withTimeout(5_000) {
+                first.state.first {
+                    it.activeWallet?.storagePath == recoveryPath && it.walletState is BeamWalletState.Restoring
+                }
+            }
+            first.closeAndJoin()
+
+            val secondFactory = FakeDemoWalletFactory(FakeDemoSession(blockFirstStart = false))
+            val second = BeamDemoController(
+                directory.toString(),
+                secondFactory,
+                walletExists = { it == directory.toString() || it == recoveryPath },
+            )
+            try {
+                second.edit { copy(databaseKeyHex = "02".repeat(32)) }
+                second.openOrCreate()
+                withTimeout(5_000) {
+                    second.state.first {
+                        it.activeWallet?.storagePath == recoveryPath && it.walletState is BeamWalletState.Ready && !it.busy
+                    }
+                }
+                assertEquals(BeamSdkConfig(BeamNetwork.Testnet, recoveryPath), secondFactory.lastOpenConfig)
+                assertEquals(0, secondFactory.restoreCalls)
+                assertEquals(0, secondFactory.createCalls)
+            } finally {
+                second.closeAndJoin()
+            }
+        } finally {
+            first.closeAndJoin()
+            deleteTree(directory)
+        }
+    }
+
+    @Test
+    fun openOrCreate_missingSelectedDatabaseDoesNotOpenEmptyBaseWallet() = runBlocking {
+        val directory = createTempDirectory("beam-demo-missing-recovery")
+        val selected = ActiveWalletIdentity(BeamNetwork.Mainnet, directory.resolve("recovery/snapshot-official").toString())
+        DemoWalletStorage.saveSelectedWallet(
+            directory.toString(),
+            ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString()),
+            selected,
+        )
+        val factory = FakeDemoWalletFactory(FakeDemoSession(blockFirstStart = false))
+        val controller = BeamDemoController(
+            directory.toString(),
+            factory,
+            walletExists = { it == directory.toString() },
+        )
+        try {
+            controller.edit { copy(databaseKeyHex = "02".repeat(32)) }
+            controller.openOrCreate()
+            val failed = withTimeout(5_000) {
+                controller.state.first { it.message == "The selected Beam wallet database is missing" && !it.busy }
+            }
+            assertNull(failed.activeWallet)
+            assertEquals(0, factory.openCalls)
+            assertEquals(0, factory.createCalls)
+        } finally {
+            controller.closeAndJoin()
+            deleteTree(directory)
+        }
+    }
+
+    @Test
+    fun selectedWalletMarker_isIgnoredForAnotherConfiguredBaseAndRejectsCorruption() = runBlocking {
+        val directory = createTempDirectory("beam-demo-selection-marker")
+        val base = ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString())
+        val selected = ActiveWalletIdentity(BeamNetwork.Mainnet, directory.resolve("recovery/snapshot-official").toString())
+        try {
+            DemoWalletStorage.saveSelectedWallet(directory.toString(), base, selected)
+            assertEquals(selected, DemoWalletStorage.loadSelectedWallet(directory.toString(), base))
+            assertNull(
+                DemoWalletStorage.loadSelectedWallet(
+                    directory.toString(),
+                    ActiveWalletIdentity(BeamNetwork.Mainnet, directory.toString()),
+                ),
+            )
+
+            Files.writeString(directory.resolve(".demo-selected-wallet"), "invalid marker")
+            val factory = FakeDemoWalletFactory(FakeDemoSession(blockFirstStart = false))
+            val controller = BeamDemoController(directory.toString(), factory, walletExists = { true })
+            try {
+                controller.edit { copy(databaseKeyHex = "02".repeat(32)) }
+                controller.openOrCreate()
+                val failed = withTimeout(5_000) {
+                    controller.state.first { it.message == "Invalid Beam selected wallet marker" && !it.busy }
+                }
+                assertNull(failed.activeWallet)
+                assertEquals(0, factory.openCalls)
+                assertEquals(0, factory.createCalls)
+            } finally {
+                controller.closeAndJoin()
+            }
+        } finally {
+            deleteTree(directory)
+        }
+    }
+
+    @Test
     fun demoHandle_initializesOnlyOnceAcrossCompositionRecreation() = runBlocking {
         val directory = createTempDirectory("beam-demo-handle")
         val session = FakeDemoSession(blockFirstStart = false)
@@ -213,6 +374,46 @@ class BeamDemoControllerTest {
             assertEquals(1, factory.openCalls)
             assertEquals(1, baseSession.closeCalls)
             assertEquals(2, baseSession.startCalls)
+            assertEquals(
+                ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString()),
+                DemoWalletStorage.loadSelectedWallet(
+                    directory.toString(),
+                    ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString()),
+                ),
+            )
+        } finally {
+            controller.closeAndJoin()
+            deleteTree(directory)
+        }
+    }
+
+    @Test
+    fun failedRecovery_closesReopenedWalletIfSelectionCannotBeSaved() = runBlocking {
+        val directory = createTempDirectory("beam-demo-rollback-marker-failure")
+        val session = FakeDemoSession(blockFirstStart = false)
+        val factory = FakeDemoWalletFactory(
+            session = session,
+            restoreFailure = IllegalStateException("restore failed"),
+        )
+        val controller = BeamDemoController(
+            directory.toString(),
+            factory,
+            walletExists = { false },
+        )
+        try {
+            controller.edit { copy(seedHex = "01".repeat(64), databaseKeyHex = "02".repeat(32)) }
+            controller.create()
+            withTimeout(5_000) { controller.state.first { it.walletState is BeamWalletState.Ready && !it.busy } }
+            Files.createDirectory(directory.resolve(".demo-selected-wallet.tmp"))
+
+            controller.edit { copy(restoreHeight = "12345") }
+            controller.restoreHeight()
+            val failed = withTimeout(5_000) {
+                controller.state.first { it.message == "restore failed" && !it.busy }
+            }
+            assertNull(failed.activeWallet)
+            assertEquals(1, factory.openCalls)
+            assertEquals(2, session.closeCalls)
         } finally {
             controller.closeAndJoin()
             deleteTree(directory)
@@ -500,6 +701,11 @@ class BeamDemoControllerTest {
             ),
         )
         try {
+            DemoWalletStorage.saveSelectedWallet(
+                directory.toString(),
+                ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString()),
+                ActiveWalletIdentity(BeamNetwork.Testnet, directory.resolve("recovery/other").toString()),
+            )
             assertTrue(DemoSendJournal.claim(directory.toString(), owner, PENDING_OPERATION_ID))
 
             controller.openOrCreate()
@@ -517,6 +723,13 @@ class BeamDemoControllerTest {
                 while (DemoSendJournal.load(directory.toString(), BeamNetwork.Testnet) != null) delay(10)
             }
             assertEquals(1, session.resolveCalls)
+            assertEquals(
+                owner,
+                DemoWalletStorage.loadSelectedWallet(
+                    directory.toString(),
+                    ActiveWalletIdentity(BeamNetwork.Testnet, directory.toString()),
+                ),
+            )
         } finally {
             DemoSendJournal.load(directory.toString(), BeamNetwork.Testnet)?.let { pending ->
                 DemoSendJournal.clear(directory.toString(), pending.owner, pending.operationId)
