@@ -18,6 +18,7 @@ if [[ ! -d "$checkout_dir/.git" ]]; then
     mkdir -p "$(dirname "$checkout_dir")"
     git clone --filter=blob:none --no-checkout "$repository" "$checkout_dir"
     git -C "$checkout_dir" fetch --depth 1 origin "$commit"
+    git -C "$checkout_dir" config core.autocrlf false
     git -C "$checkout_dir" checkout --detach "$commit"
 fi
 
@@ -72,7 +73,7 @@ if [[ -f "$patch_state" ]]; then
         echo "Beam Core checkout changed after applying the recorded patch stack" >&2
         exit 1
     fi
-    git -C "$checkout_dir" diff --check HEAD
+    git -C "$checkout_dir" -c core.whitespace=cr-at-eol diff --check HEAD
     printf '%s\n' "$checkout_dir"
     exit 0
 fi
@@ -87,7 +88,7 @@ for patch_file in "${patch_files[@]}"; do
     git -C "$checkout_dir" apply "$patch_file"
 done
 
-git -C "$checkout_dir" diff --check HEAD
+git -C "$checkout_dir" -c core.whitespace=cr-at-eol diff --check HEAD
 patched_tree_digest="$(git -C "$checkout_dir" diff --binary HEAD | git hash-object --stdin)"
 patch_state_temp="$patch_state.tmp.$$"
 printf '%s %s\n' "$patch_stack_digest" "$patched_tree_digest" > "$patch_state_temp"

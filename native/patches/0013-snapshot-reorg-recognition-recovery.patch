@@ -1,5 +1,5 @@
 diff --git a/core/fly_client.cpp b/core/fly_client.cpp
-index 55bebb0..03f2845 100644
+index 55bebb031..03f2845a7 100644
 --- a/core/fly_client.cpp
 +++ b/core/fly_client.cpp
 @@ -718,6 +718,8 @@ void FlyClient::NetworkStd::Connection::PostChainworkProof(const StateArray& arr
@@ -64,7 +64,7 @@ index 55bebb0..03f2845 100644
      if (msg.m_Assets.empty())
      {
 diff --git a/core/fly_client.h b/core/fly_client.h
-index cc158b1..5920690 100644
+index cc158b116..5920690e0 100644
 --- a/core/fly_client.h
 +++ b/core/fly_client.h
 @@ -97,6 +97,8 @@ namespace proto {
@@ -95,7 +95,7 @@ index cc158b1..5920690 100644
              static void ClearRecoveryResponseForTests(Request& request) {
                  ClearRecoveryResponse(request);
 diff --git a/wallet/client/wallet_client.cpp b/wallet/client/wallet_client.cpp
-index 456004e..1f214e6 100644
+index 456004e4e..1f214e683 100644
 --- a/wallet/client/wallet_client.cpp
 +++ b/wallet/client/wallet_client.cpp
 @@ -729,6 +729,9 @@ namespace beam::wallet
@@ -109,7 +109,7 @@ index 456004e..1f214e6 100644
  
                  updateMaxPrivacyStatsImpl(getStatus());
 diff --git a/wallet/core/base_transaction.cpp b/wallet/core/base_transaction.cpp
-index e3f1ce6..0a0db36 100644
+index e3f1ce6e8..0a0db363f 100644
 --- a/wallet/core/base_transaction.cpp
 +++ b/wallet/core/base_transaction.cpp
 @@ -106,7 +106,8 @@ namespace beam::wallet
@@ -154,7 +154,7 @@ index e3f1ce6..0a0db36 100644
  
          if (notify)
 diff --git a/wallet/core/base_transaction.h b/wallet/core/base_transaction.h
-index b201650..ff8064b 100644
+index b2016508c..ff8064b9b 100644
 --- a/wallet/core/base_transaction.h
 +++ b/wallet/core/base_transaction.h
 @@ -140,6 +140,11 @@ namespace beam::wallet
@@ -179,7 +179,7 @@ index b201650..ff8064b 100644
          io::AsyncEvent::Ptr m_EventToUpdate;
      };
 diff --git a/wallet/core/base_tx_builder.cpp b/wallet/core/base_tx_builder.cpp
-index eb1adfe..0fde9d3 100644
+index eb1adfe28..0fde9d3c5 100644
 --- a/wallet/core/base_tx_builder.cpp
 +++ b/wallet/core/base_tx_builder.cpp
 @@ -39,7 +39,8 @@ namespace beam::wallet
@@ -236,7 +236,7 @@ index eb1adfe..0fde9d3 100644
              try {
                  if (!pHandler->OnList(b, msg))
 diff --git a/wallet/core/base_tx_builder.h b/wallet/core/base_tx_builder.h
-index 97b3098..1006e58 100644
+index 97b30984a..1006e58e4 100644
 --- a/wallet/core/base_tx_builder.h
 +++ b/wallet/core/base_tx_builder.h
 @@ -160,7 +160,9 @@ namespace beam::wallet
@@ -251,7 +251,7 @@ index 97b3098..1006e58 100644
              virtual void OnSuccess(BaseTxBuilder&) = 0;
              virtual void OnFailed(BaseTxBuilder&, IPrivateKeyKeeper2::Status::Type);
 diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
-index b741cb6..c6ad2aa 100644
+index b741cb644..c6ad2aacb 100644
 --- a/wallet/core/wallet.cpp
 +++ b/wallet/core/wallet.cpp
 @@ -159,6 +159,32 @@ namespace beam::wallet
@@ -1044,7 +1044,7 @@ index b741cb6..c6ad2aa 100644
          {
              return;
 diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
-index b7b6e04..b0c47cd 100644
+index b7b6e04fd..b0c47cd66 100644
 --- a/wallet/core/wallet.h
 +++ b/wallet/core/wallet.h
 @@ -162,6 +162,12 @@ namespace beam::wallet
@@ -1139,7 +1139,7 @@ index b7b6e04..b0c47cd 100644
              m_NodeEndpoint->PostRequest(x, m_RequestHandler); \
               \
 diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
-index f21abb1..7facfa6 100644
+index f21abb1ed..7facfa6bb 100644
 --- a/wallet/core/wallet_db.cpp
 +++ b/wallet/core/wallet_db.cpp
 @@ -3164,6 +3164,8 @@ namespace beam::wallet
@@ -1253,7 +1253,7 @@ index f21abb1..7facfa6 100644
      {
          return m_History;
 diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
-index 7104f9e..6aec8d1 100644
+index 7104f9e36..6aec8d132 100644
 --- a/wallet/core/wallet_db.h
 +++ b/wallet/core/wallet_db.h
 @@ -13,6 +13,7 @@
