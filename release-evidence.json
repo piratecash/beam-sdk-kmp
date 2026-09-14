@@ -1,23 +1,24 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "814d133d49616d81b9137552d40f2ec100639fe0",
+  "testedCommit": "d95aec061e5a4f780c0e8de7ac9ee000d19513ba",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
+  "smokeScope": "CI SDK/native artifacts from testedCommit in an isolated sample with temporary test-only seed configuration: create, cold reopen, and PublicOffline receive token; no network start or send.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
-      "device": "Pixel 6 API 28 emulator",
-      "apiLevel": 28,
-      "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-      "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-07T07:21:24Z"
-    },
-    "armeabi-v7a": {
-      "status": "passed",
-      "device": "Pixel 6",
+      "device": "Pixel 6 physical device (forced arm64-v8a)",
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-07T07:21:24Z"
+      "testedAtUtc": "2026-09-14T02:57:38Z"
+    },
+    "armeabi-v7a": {
+      "status": "passed",
+      "device": "Pixel 6 physical device (forced armeabi-v7a)",
+      "apiLevel": 37,
+      "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
+      "walletSmoke": "passed",
+      "testedAtUtc": "2026-09-14T02:59:22Z"
     }
   }
 }
