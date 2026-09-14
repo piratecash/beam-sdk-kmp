@@ -2137,6 +2137,9 @@ auto jniCall(JNIEnv* environment, Function&& function, Fallback fallback) -> dec
 
 }  // namespace
 
+// The send-admission fixture includes this file to reuse Session internals and jniCall.
+// Exporting BeamNative from that DSO would create a second JNI API backed by a second registry.
+#if !defined(beam_sdk_kmp_send_admission_fixture_EXPORTS)
 extern "C" JNIEXPORT jstring JNICALL
 Java_cash_p_beam_internal_BeamNative_version(JNIEnv* environment, jobject) {
     return newJavaString(environment, std::string("beam-7.5.14493+") + BEAM_SDK_CORE_COMMIT);
@@ -2438,4 +2441,5 @@ Java_cash_p_beam_internal_BeamNative_newWalletTipFreshForTests(
         ) ? JNI_TRUE : JNI_FALSE;
     }, JNI_FALSE);
 }
+#endif
 #endif

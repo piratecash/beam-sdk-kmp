@@ -675,7 +675,7 @@ void runFixture()
     {
         std::cerr << "U diagnostic found=" << foundU << " confirm=" << recovered.m_confirmHeight
                   << " spent=" << recovered.m_spentHeight << " cursor=" << storage::getNextEventHeight(*db) << std::endl;
-        db->visitCoins([](const Coin& c) { if (c.m_ID.m_Idx == C) std::cerr << "C coin=" << c.m_ID
+        db->visitCoins([&](const Coin& c) { if (c.m_ID.m_Idx == C) std::cerr << "C coin=" << c.m_ID
             << " confirm=" << c.m_confirmHeight << " spent=" << c.m_spentHeight << std::endl; return true; });
     }
     require(foundU && recovered.m_confirmHeight == C && recovered.m_spentHeight == MaxHeight,
