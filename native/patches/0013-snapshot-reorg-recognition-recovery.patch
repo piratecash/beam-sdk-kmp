@@ -251,7 +251,7 @@ index 97b30984a..1006e58e4 100644
              virtual void OnSuccess(BaseTxBuilder&) = 0;
              virtual void OnFailed(BaseTxBuilder&, IPrivateKeyKeeper2::Status::Type);
 diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
-index b741cb644..c6ad2aacb 100644
+index b741cb644..a7740ab6e 100644
 --- a/wallet/core/wallet.cpp
 +++ b/wallet/core/wallet.cpp
 @@ -159,6 +159,32 @@ namespace beam::wallet
@@ -605,10 +605,10 @@ index b741cb644..c6ad2aacb 100644
 +        m_RecoveryLiveTip = false;
 +        m_RecoveryProofsStarted = false;
 +        m_RecoveryProofHeights.clear();
-+        m_RecoveryLiveQuorum = {};
++        m_RecoveryLiveQuorum = HeightHash{Zero, 0};
 +        m_RecoveryLiveQuorumPending = false;
 +        m_WaitingRecoveryCursor = false;
-+        m_VerifiedRecoveryCursor = {};
++        m_VerifiedRecoveryCursor = HeightHash{Zero, 0};
 +        m_HistoricalHeaderCandidate = boost::none;
 +        m_HistoricalHeaderCandidatePeer = io::Address();
 +        m_HistoricalHeaderQuorumRetries = 0;
@@ -643,7 +643,7 @@ index b741cb644..c6ad2aacb 100644
 +            SetTreasuryHandled(false);
 +            storage::setNeedToRequestBodies(*db, true);
 +            m_RecognitionRecovery.m_Boundary = 0;
-+            m_RecognitionRecovery.m_Cursor = {};
++            m_RecognitionRecovery.m_Cursor = HeightHash{Zero, 0};
 +            m_RecognitionRecovery.m_Phase = RecognitionRecovery::Replay;
 +            storage::setBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery);
 +            RecoveryCheckpoint("reset-before-commit");
@@ -690,7 +690,7 @@ index b741cb644..c6ad2aacb 100644
 +        Block::SystemState::Full tip;
 +        get_tip(tip);
 +        tip.get_ID(m_RecognitionRecovery.m_Target);
-+        m_RecognitionRecovery.m_Cursor = h ? m_VerifiedRecoveryCursor : HeightHash{};
++        m_RecognitionRecovery.m_Cursor = h ? m_VerifiedRecoveryCursor : HeightHash{Zero, 0};
 +        storage::setBlobVar(*m_WalletDB, RecognitionRecovery::Key, m_RecognitionRecovery);
 +    }
 +
@@ -901,7 +901,7 @@ index b741cb644..c6ad2aacb 100644
 +        struct Anchor : Block::SystemState::IHistory::IWalker
 +        {
 +            Height limit;
-+            HeightHash id = {};
++            HeightHash id = {Zero, 0};
 +            bool OnState(const Block::SystemState::Full& state) override
 +            {
 +                if (state.get_Height() >= limit) return true;
@@ -1044,7 +1044,7 @@ index b741cb644..c6ad2aacb 100644
          {
              return;
 diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
-index b7b6e04fd..b0c47cd66 100644
+index b7b6e04fd..7006e1611 100644
 --- a/wallet/core/wallet.h
 +++ b/wallet/core/wallet.h
 @@ -162,6 +162,12 @@ namespace beam::wallet
@@ -1090,9 +1090,9 @@ index b7b6e04fd..b0c47cd66 100644
 +        uint64_t m_TransactionEpoch = 0;
 +        bool m_RecoveryProofsStarted = false;
 +        std::map<TxID, Height> m_RecoveryProofHeights;
-+        HeightHash m_RecoveryLiveQuorum = {};
++        HeightHash m_RecoveryLiveQuorum = {Zero, 0};
 +        bool m_RecoveryLiveQuorumPending = false;
-+        std::shared_ptr<uint8_t> m_RecoveryLifetime = std::make_shared<uint8_t>(0);
++        std::shared_ptr<uint8_t> m_RecoveryLifetime = std::make_shared<uint8_t>(uint8_t{0});
 +        void CloseRecoveryAdmission();
 +        void ResetRecognitionRecovery(bool ownBatch = true);
 +        void PersistRecognitionRecovery(Height);
@@ -1102,7 +1102,7 @@ index b7b6e04fd..b0c47cd66 100644
 +        void ProcessRecoveryEvent(Height, const proto::Event::Base&);
 +        bool EnsureRecoveryCursor(Height, std::function<void()>&&);
 +        bool m_WaitingRecoveryCursor = false;
-+        HeightHash m_VerifiedRecoveryCursor = {};
++        HeightHash m_VerifiedRecoveryCursor = {Zero, 0};
 +        static void RecoveryCheckpoint(const char*);
  
  // The following macros define
@@ -1253,7 +1253,7 @@ index f21abb1ed..7facfa6bb 100644
      {
          return m_History;
 diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
-index 7104f9e36..6aec8d132 100644
+index 7104f9e36..aec686b0b 100644
 --- a/wallet/core/wallet_db.h
 +++ b/wallet/core/wallet_db.h
 @@ -13,6 +13,7 @@
@@ -1278,10 +1278,10 @@ index 7104f9e36..6aec8d132 100644
 +        bool m_Snapshot = false;
 +        bool m_HistoryComplete = false;
 +        bool m_RollbackPending = false;
-+        HeightHash m_Import = {};
-+        HeightHash m_Anchor = {};
-+        HeightHash m_Target = {};
-+        HeightHash m_Cursor = {};
++        HeightHash m_Import = {Zero, 0};
++        HeightHash m_Anchor = {Zero, 0};
++        HeightHash m_Target = {Zero, 0};
++        HeightHash m_Cursor = {Zero, 0};
 +        Height m_OriginalBirthday = 0;
 +        Height m_Boundary = 0;
 +        template <typename Archive> void serialize(Archive& ar)
