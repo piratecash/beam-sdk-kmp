@@ -2600,9 +2600,12 @@ auto jniCall(JNIEnv* environment, Function&& function, Fallback fallback) -> dec
 
 }  // namespace
 
-// The send-admission fixture includes this file to reuse Session internals and jniCall.
-// Exporting BeamNative from that DSO would create a second JNI API backed by a second registry.
-#if !defined(beam_sdk_kmp_send_admission_fixture_EXPORTS)
+// Test fixtures (send-admission, offline-history) include this file to reuse Session internals
+// and jniCall. Exporting BeamNative from such a DSO would create a second JNI API backed by a
+// second registry, and the JVM may bind BeamNative to whichever library it loaded first.
+// Everything below down to the end of the file stays inside this guard.
+#if !defined(beam_sdk_kmp_send_admission_fixture_EXPORTS) && \
+    !defined(beam_sdk_kmp_offline_history_fixture_EXPORTS)
 extern "C" JNIEXPORT jstring JNICALL
 Java_cash_p_beam_internal_BeamNative_version(JNIEnv* environment, jobject) {
     return newJavaString(environment, std::string("beam-7.5.14493+") + BEAM_SDK_CORE_COMMIT);
@@ -2918,8 +2921,7 @@ Java_cash_p_beam_internal_BeamNative_newWalletTipFreshForTests(
         ) ? JNI_TRUE : JNI_FALSE;
     }, JNI_FALSE);
 }
-#endif
-#endif
+#endif // BEAM_SDK_KMP_TESTS
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_cash_p_beam_internal_BeamNative_quoteSend(JNIEnv* env, jobject, jlong handle, jstring receiver,
@@ -2950,3 +2952,4 @@ Java_cash_p_beam_internal_BeamNative_exportSignedTransaction(JNIEnv* env, jobjec
         return result;
     }, static_cast<jbyteArray>(nullptr));
 }
+#endif // fixture export isolation

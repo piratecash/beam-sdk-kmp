@@ -124,7 +124,7 @@ class BeamWalletFactoryTest {
 
         session.stop()
 
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
         assertFalse(session.balance.value.isAuthoritative)
     }
 
@@ -162,7 +162,7 @@ class BeamWalletFactoryTest {
         stopping.join()
 
         assertEquals(1, backend.stopCalls)
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
         session.start()
         assertEquals(2, backend.startCalls)
     }
@@ -180,7 +180,7 @@ class BeamWalletFactoryTest {
 
         assertEquals(1, backend.startCalls)
         assertEquals(1, backend.stopCalls)
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
     }
 
     @Test
@@ -201,7 +201,7 @@ class BeamWalletFactoryTest {
 
         assertEquals(1, backend.startCalls)
         assertEquals(1, backend.stopCalls)
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
     }
 
     @Test
@@ -224,7 +224,7 @@ class BeamWalletFactoryTest {
         assertEquals(0, backend.resolveCalls)
         assertEquals(0, backend.abortCalls)
         assertEquals(1, backend.stopCalls)
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
     }
 
     @Test
@@ -261,7 +261,7 @@ class BeamWalletFactoryTest {
         assertEquals(0, backend.commitCalls)
         allowStop.complete(Unit)
         stopping.join()
-        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.awaitStopped()
     }
 
     @Test
@@ -410,6 +410,13 @@ class BeamWalletFactoryTest {
     }
 }
 
+// The session applies backend snapshots on its own Dispatchers.Default scope, so right after
+// stop() returns a snapshot collected earlier may still be in flight. The contract is eventual:
+// the last published snapshot (Stopped) wins, which is what this waits for.
+private suspend fun BeamWalletSession.awaitStopped() {
+    assertIs<BeamWalletState.Stopped>(state.first { it is BeamWalletState.Stopped })
+}
+
 private class FakeBackend(
     transactionCount: Int = 0,
     private val prepareAccepted: CompletableDeferred<Unit>? = null,
@@ -479,6 +486,12 @@ private class FakeBackend(
         stopCalls++
         stopStarted?.complete(Unit)
         allowStop?.await()
+        // Mirror the JNI backend: a stop publishes a Stopped snapshot, so a Ready snapshot that
+        // was still being collected on the session scope is always followed by Stopped.
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            phase = BackendPhase.Stopped,
+            balance = mutableSnapshot.value.balance.copy(isAuthoritative = false),
+        )
     }
 
     override suspend fun close() {

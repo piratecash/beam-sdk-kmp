@@ -808,20 +808,20 @@ void run(const std::filesystem::path& dir)
         // A NEW post-sync operation exercises Core's historical small-window selection.
         const Cache refreshed = priorSync(node);
         ++scenario;
-        Captured small;
+        Captured smallProof;
         {
             Session s(dir / "historical-small.db", funds, refreshed, Inputs::Shielded, Fault::None);
             auto recipient = chooseRecipient(dir, scenario, TxAddressType::PublicOffline);
             s.prepare(recipient, 20'000'000, scenario);
-            small = successful(s, Inputs::Shielded, recipient.type, Fault::None);
+            smallProof = successful(s, Inputs::Shielded, recipient.type, Fault::None);
         }
-        auto tx = decode(small.bytes);
+        auto tx = decode(smallProof.bytes);
         require(shieldedInputs(*tx) == 1, "small-window case lost shielded input");
         for (const auto& kernel : tx->m_vKernels)
             if (kernel->get_Subtype() == TxKernel::Subtype::ShieldedInput)
                 require(kernel->CastTo_ShieldedInput().m_SpendProof.m_Cfg == rules.Shielded.m_ProofMin,
                     "Core did not select its historical small proof");
-        require(relay(node, small.bytes, relayConfig) == proto::TxStatus::Ok, "historical small proof rejected");
+        require(relay(node, smallProof.bytes, relayConfig) == proto::TxStatus::Ok, "historical small proof rejected");
         std::cout << "HISTORICAL_SMALL_PROOF_ACCEPTED\n";
     }
     std::cout << "PRODUCTION_GATES: durable cache/quorum; SDK recovery active membership; resume/export exclusions; "
