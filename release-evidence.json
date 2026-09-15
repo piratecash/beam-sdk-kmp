@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "d95aec061e5a4f780c0e8de7ac9ee000d19513ba",
+  "testedCommit": "0b4a0240ba02935b4450c4d9a68299d26278a155",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-  "smokeScope": "CI SDK/native artifacts from testedCommit in an isolated sample with temporary test-only seed configuration: create, cold reopen, and PublicOffline receive token; no network start or send.",
+  "smokeScope": "CI SDK/native artifacts from testedCommit (run 34962632614: android-aar and native-android, identical .so sha256) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token, stateless token parser, unfunded offline quote rejected; no network start or send.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
@@ -10,7 +10,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-14T02:57:38Z"
+      "testedAtUtc": "2026-09-15T11:45:57Z"
     },
     "armeabi-v7a": {
       "status": "passed",
@@ -18,7 +18,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-14T02:59:22Z"
+      "testedAtUtc": "2026-09-15T11:49:51Z"
     }
   }
 }
