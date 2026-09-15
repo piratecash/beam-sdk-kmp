@@ -120,6 +120,8 @@ jobs:
           java-version: "21"
           cache: gradle
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools # the legacy 'tools' package is no longer published
       - name: Install pinned NDK
         run: sdkmanager "ndk;27.0.12077973"
       - name: Build Android native matrix
