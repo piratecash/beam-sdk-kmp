@@ -6,6 +6,13 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      production_proofs:
+        description: Run expensive production offline-signer proofs on Linux
+        type: choice
+        default: "off"
+        options: ["off", small, full]
 
 concurrency:
   group: beam-sdk-${{ github.ref }}
@@ -23,18 +30,21 @@ jobs:
             binary: libbeam_sdk_kmp.so
             snapshot_reorg_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_snapshot_reorg_fixture.so
             send_admission_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_send_admission_fixture.so
+            offline_history_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_offline_history_fixture.so
           - os: windows-2022
             artifact: windows-x64
             triple: x86_64-pc-windows-msvc
             binary: beam_sdk_kmp.dll
             snapshot_reorg_fixture: .native-cache/build-host-tests/Release/beam_sdk_kmp_snapshot_reorg_fixture.dll
             send_admission_fixture: .native-cache/build-host-tests/Release/beam_sdk_kmp_send_admission_fixture.dll
+            offline_history_fixture: .native-cache/build-host-tests/Release/beam_sdk_kmp_offline_history_fixture.dll
           - os: macos-15
             artifact: macos-arm64
             triple: aarch64-apple-darwin
             binary: libbeam_sdk_kmp.dylib
             snapshot_reorg_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_snapshot_reorg_fixture.dylib
             send_admission_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_send_admission_fixture.dylib
+            offline_history_fixture: .native-cache/build-host-tests/libbeam_sdk_kmp_offline_history_fixture.dylib
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -48,6 +58,8 @@ jobs:
         run: ./scripts/fetch-host-dependencies.sh
       - name: Build instrumented native library
         shell: bash
+        env:
+          BEAM_NATIVE_PRODUCTION_PROOFS: ${{ runner.os == 'Linux' && inputs.production_proofs || 'off' }}
         run: |
           ./scripts/fetch-beam-core.sh
           BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-tests BEAM_NATIVE_TESTS=1 ./scripts/build-native-host.sh
@@ -57,15 +69,19 @@ jobs:
           BEAM_EXPECT_NATIVE_TEST_FIXTURES: "1"
           BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE: "1"
           BEAM_EXPECT_SEND_ADMISSION_FIXTURE: "1"
+          BEAM_EXPECT_OFFLINE_HISTORY_FIXTURE: "1"
         run: |
           snapshot_reorg_fixture="$GITHUB_WORKSPACE/${{ matrix.snapshot_reorg_fixture }}"
           send_admission_fixture="$GITHUB_WORKSPACE/${{ matrix.send_admission_fixture }}"
+          offline_history_fixture="$GITHUB_WORKSPACE/${{ matrix.offline_history_fixture }}"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             snapshot_reorg_fixture="$(cygpath -w "$snapshot_reorg_fixture")"
             send_admission_fixture="$(cygpath -w "$send_admission_fixture")"
+            offline_history_fixture="$(cygpath -w "$offline_history_fixture")"
           fi
           BEAM_SNAPSHOT_REORG_FIXTURE="$snapshot_reorg_fixture" \
             BEAM_SEND_ADMISSION_FIXTURE="$send_admission_fixture" \
+            BEAM_OFFLINE_HISTORY_FIXTURE="$offline_history_fixture" \
             ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest --console=plain
       - name: Build production native library
         shell: bash

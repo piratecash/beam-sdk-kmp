@@ -123,6 +123,7 @@ private class DefaultBeamWalletSession(
     private val mutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutableState = MutableStateFlow<BeamWalletState>(BeamWalletState.Stopped)
+    private val mutableOfflineSigningState = MutableStateFlow<BeamOfflineSigningState>(BeamOfflineSigningState.Unavailable)
     private val mutableBalance = MutableStateFlow(BeamBalance())
     private val mutableTransactions = MutableStateFlow<List<BeamTransaction>>(emptyList())
     private var closed = false
@@ -133,6 +134,7 @@ private class DefaultBeamWalletSession(
     private var startAttempt: Deferred<Unit>? = null
 
     override val state: StateFlow<BeamWalletState> = mutableState
+    override val offlineSigningState: StateFlow<BeamOfflineSigningState> = mutableOfflineSigningState
     override val balance: StateFlow<BeamBalance> = mutableBalance
     override val transactions: StateFlow<List<BeamTransaction>> = mutableTransactions
 
@@ -141,6 +143,7 @@ private class DefaultBeamWalletSession(
             backend.snapshot.collectLatest { snapshot ->
                 mutex.withLock {
                     if (closed) return@withLock
+                    mutableOfflineSigningState.value = snapshot.offlineSigningState
                     mutableBalance.value = snapshot.balance
                     mutableTransactions.value = snapshot.transactions
                     if (!stopping) mutableState.value = snapshot.toWalletState()
@@ -249,6 +252,7 @@ private class DefaultBeamWalletSession(
                     stopping = false
                     mutableState.value = BeamWalletState.Closed
                     mutableBalance.value = BeamBalance()
+                    mutableOfflineSigningState.value = BeamOfflineSigningState.Unavailable
                     mutableTransactions.value = emptyList()
                     scope.cancel()
                 }
@@ -268,6 +272,45 @@ private class DefaultBeamWalletSession(
         require(limit in 1..MAX_PAGE_SIZE) { "limit must be in 1..$MAX_PAGE_SIZE" }
         val items = backend.transactions(offset, limit)
         BeamTransactionPage(items, (offset + items.size).takeIf { items.size == limit })
+    }
+
+    override suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote = mutex.withLock {
+        checkReconciliationAvailable()
+        validateQuoteRequest(request)
+        if (request.context is BeamSendContext.Online) checkReady() else checkStoppedSigner()
+        backend.quoteSend(request)
+    }
+
+    override suspend fun signOffline(
+        operationId: String, request: BeamQuoteRequest, quoteVersion: String,
+    ): BeamOfflineSignResult {
+        mutex.withLock {
+            checkReconciliationAvailable()
+            checkStoppedSigner()
+            validateOperationId(operationId)
+            validateQuoteRequest(request)
+            require(request.context is BeamSendContext.Offline) { "Offline context required" }
+            require(quoteVersion.length == 64) { "Invalid quote version" }
+        }
+        // Native owns the full signing scope. Close/stop can fence it while callbacks drain.
+        return backend.signOffline(operationId, request, quoteVersion)
+    }
+
+    override suspend fun exportSignedTransaction(operationId: String): ByteArray {
+        mutex.withLock { checkReconciliationAvailable(); validateOperationId(operationId) }
+        return backend.exportSignedTransaction(operationId)
+    }
+
+    private fun checkStoppedSigner() {
+        if (running || starting || stopping || state.value != BeamWalletState.Stopped)
+            throw BeamFailure.SendBusy("Offline signing requires a stopped owner")
+    }
+
+    private fun validateQuoteRequest(request: BeamQuoteRequest) {
+        require(request.receiverToken.isNotBlank() && request.receiverToken.length <= 65_536)
+        require(request.comment.encodeToByteArray().size <= MAX_COMMENT_BYTES)
+        if (request.amount is BeamSendAmount.Exact) require(request.amount.amount > 0)
+        if (request.context is BeamSendContext.Offline) require(request.context.contextId.isNotBlank())
     }
 
     override suspend fun previewSend(request: BeamSendRequest): BeamSendPreview = mutex.withLock {
@@ -299,6 +342,16 @@ private class DefaultBeamWalletSession(
             validateOperationId(operationId)
         }
         return backend.resolveSend(operationId)
+    }
+
+    override suspend fun sendOperations(): List<BeamSendOperation> = mutex.withLock {
+        checkReconciliationAvailable()
+        backend.sendOperations()
+    }
+
+    override suspend fun recoverSendOperations(): List<BeamSendOperation> = mutex.withLock {
+        checkReady()
+        backend.recoverSendOperations()
     }
 
     override suspend fun abortPrepared(operationId: String): Boolean {

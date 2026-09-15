@@ -146,8 +146,10 @@ tasks.named<Test>("desktopTest") {
     val externalFixtureConfigured =
         providers.environmentVariable("BEAM_SNAPSHOT_REORG_FIXTURE").orNull?.isNotBlank() == true ||
             providers.environmentVariable("BEAM_SEND_ADMISSION_FIXTURE").orNull?.isNotBlank() == true ||
+            providers.environmentVariable("BEAM_OFFLINE_HISTORY_FIXTURE").orNull?.isNotBlank() == true ||
             providers.environmentVariable("BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE").orNull == "1" ||
-            providers.environmentVariable("BEAM_EXPECT_SEND_ADMISSION_FIXTURE").orNull == "1"
+            providers.environmentVariable("BEAM_EXPECT_SEND_ADMISSION_FIXTURE").orNull == "1" ||
+            providers.environmentVariable("BEAM_EXPECT_OFFLINE_HISTORY_FIXTURE").orNull == "1"
     if (externalFixtureConfigured) {
         // External JNI fixtures are neither source-set inputs nor task outputs. Always execute the
         // configured tests so replacing a library cannot leave a stale UP-TO-DATE or cached result.

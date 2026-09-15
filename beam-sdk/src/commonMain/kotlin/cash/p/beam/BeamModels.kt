@@ -162,6 +162,24 @@ public data class PreparedBeamSend(
     val transactionId: String,
 )
 
+/** A durable send owned by this wallet database and network. */
+public data class BeamSendOperation(
+    val operationId: String,
+    val transactionId: String,
+    val requestHash: String,
+    val amount: Long,
+    val fee: Long,
+    val resolution: BeamSendResolution,
+    val deliveryMode: BeamSendDeliveryMode = BeamSendDeliveryMode.Online,
+    val offlineState: BeamOfflineSendState? = null,
+    val contextId: String? = null,
+    val rules: String? = null,
+    val serializedHash: String? = null,
+    val mainKernelId: String? = null,
+    /** Original kernel and all inputs observed at this height; zero means unconfirmed/unknown. */
+    val observedProofHeight: Long = 0,
+)
+
 public sealed interface BeamSendResolution {
     public data object NotPrepared : BeamSendResolution
     public data class Prepared(val transactionId: String) : BeamSendResolution
@@ -179,6 +197,13 @@ public sealed class BeamFailure(
     cause: Throwable? = null,
     public val retryable: Boolean,
 ) : Exception(message, cause) {
+    public class ContextUnavailable(message: String) : BeamFailure(message, retryable = true)
+    public class StaleQuote(message: String) : BeamFailure(message, retryable = true)
+    public class SendBusy(message: String) : BeamFailure(message, retryable = true)
+    public class InvalidAddress(message: String) : BeamFailure(message, retryable = false)
+    public class QuoteUnavailable(message: String) : BeamFailure(message, retryable = true)
+    public class SigningInterrupted(message: String) : BeamFailure(message, retryable = true)
+    public class OperationConflict(message: String) : BeamFailure(message, retryable = false)
     public class Validation(message: String) : BeamFailure(message, retryable = false)
     public class InsufficientFunds(message: String) : BeamFailure(message, retryable = false)
     /** Admission postponed by an unresolved outgoing transaction. Retry with the same operationId. */
@@ -198,4 +223,18 @@ public sealed class BeamFailure(
         BeamFailure(message, cause, retryable = false)
     public class Unsupported(message: String) : BeamFailure(message, retryable = false)
     public class Cancelled : BeamFailure("Operation cancelled", retryable = true)
+}
+
+/** Readiness of a saved signing context, independent of connectivity and the unknown live tip.
+ * Ready does not promise current chain acceptance, nor authorize signing/export or broadcast.
+ */
+public sealed interface BeamOfflineSigningState {
+    public data object Unavailable : BeamOfflineSigningState
+    public data object Preparing : BeamOfflineSigningState
+    public data class Ready(
+        val contextId: String,
+        val height: Long,
+        val shieldedCount: Long,
+    ) : BeamOfflineSigningState
+    public data object Invalidated : BeamOfflineSigningState
 }

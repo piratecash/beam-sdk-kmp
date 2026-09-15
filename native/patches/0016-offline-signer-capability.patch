@@ -1,0 +1,358 @@
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -130,7 +130,8 @@
+         using TxVisitor = std::function<void (const TxID&, BaseTransaction::Ptr)>;
+         using OnSyncAction = std::function<void()>;
+ 
+-        Wallet(IWalletDB::Ptr walletDB, TxCompletedAction&& action = TxCompletedAction(), UpdateCompletedAction&& updateCompleted = UpdateCompletedAction());
++        enum class ExecutionMode { Online, Offline };
++        Wallet(IWalletDB::Ptr walletDB, TxCompletedAction&& action = TxCompletedAction(), UpdateCompletedAction&& updateCompleted = UpdateCompletedAction(), ExecutionMode mode = ExecutionMode::Online);
+         virtual ~Wallet();
+         void CleanupNetwork();
+ 
+@@ -166,6 +167,14 @@
+         bool IsRecoveryAdmissionOpen() const { return !m_RecoveryPolicy || m_RecoveryAdmission; }
+         uint64_t TransactionEpoch() const { return m_TransactionEpoch; }
+         bool CanProcessTransaction(const BaseTransaction&) const;
++        // SDK intent is in the encrypted operation record, before any Core row. Unknown
++        // records fence all transaction construction. Offline membership never joins resume.
++        bool IsOfflineTransaction(const TxID&) const;
++        bool IsOfflineSigningIntent(const TxID&) const;
++        void RequestOfflineKernelProofs();
++        BaseTransaction::Ptr BeginOfflineTransaction(const TxParameters&, INegotiatorGateway&,
++            BaseTransaction::Creator::Ptr, std::function<bool()> admission);
++        void EndOfflineTransaction();
+         void ConfigureRecoveryQuorum();
+         // Owner-thread notification only; false fences context work before tip/recovery changes.
+         // Does not alter transaction admission, active membership, or startup resume.
+@@ -622,6 +631,9 @@
+ 
+         // List of currently active (incomplete) transactions
+         std::map<TxID, BaseTransaction::Ptr> m_ActiveTransactions;
++        ExecutionMode m_ExecutionMode;
++        BaseTransaction::Ptr m_OfflineTransaction;
++        std::function<bool()> m_OfflineAdmission;
+ 
+         // List of transactions that are waiting for the next tip (new block) to arrive
+         std::unordered_set<BaseTransaction::Ptr> m_NextTipTransactionToUpdate;
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ #include "wallet.h"
++#include "3rdparty/nlohmann/json.hpp"
+ #include <boost/uuid/uuid.hpp>
+ 
+ #include "core/ecc_native.h"
+@@ -141,8 +142,9 @@
+         return temp;
+     }
+     
+-    Wallet::Wallet(IWalletDB::Ptr walletDB, TxCompletedAction&& action, UpdateCompletedAction&& updateCompleted)
++    Wallet::Wallet(IWalletDB::Ptr walletDB, TxCompletedAction&& action, UpdateCompletedAction&& updateCompleted, ExecutionMode mode)
+         : m_WalletDB{ walletDB }
++        , m_ExecutionMode(mode)
+         , m_TxCompletedAction{ std::move(action) }
+         , m_UpdateCompleted{ std::move(updateCompleted) }
+         , m_LastSyncTotal(0)
+@@ -165,7 +167,7 @@
+         {
+             auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
+             if (!db) throw std::runtime_error("Recovery requires WalletDB");
+-            db->SetSelectionAllowed(false);
++            if (m_ExecutionMode != ExecutionMode::Offline) db->SetSelectionAllowed(false);
+             if (!storage::getBlobVar(*db, RecognitionRecovery::Key, m_RecognitionRecovery))
+             {
+                 m_RecognitionRecovery.m_OriginalBirthday = m_BodyBirthdayBoundary;
+@@ -269,6 +271,7 @@
+ 
+     void Wallet::SetNodeEndpoint(proto::FlyClient::INetwork::Ptr nodeEndpoint)
+     {
++        if (m_ExecutionMode == ExecutionMode::Offline) throw std::runtime_error("Offline owner forbids network");
+         m_NodeEndpoint = std::move(nodeEndpoint);
+     }
+ 
+@@ -279,12 +282,16 @@
+ 
+     void Wallet::AddMessageEndpoint(IWalletMessageEndpoint::Ptr endpoint)
+     {
++        if (m_ExecutionMode == ExecutionMode::Offline) throw std::runtime_error("Offline owner forbids network");
+         m_MessageEndpoints.insert(endpoint);
+     }
+ 
+     // Rescan the blockchain for UTXOs and shielded coins
+     void Wallet::Rescan()
+     {
++        for (const auto& tx : m_WalletDB->getTxHistory(TxType::ALL))
++            if (IsOfflineTransaction(tx.m_txId))
++                throw std::runtime_error("Offline transaction prevents destructive rescan");
+         AbortEvents();
+         AbortBodiesRequests();
+         ++m_BodyRequestGeneration;
+@@ -338,7 +345,7 @@
+ 
+     TxID Wallet::StartTransaction(const TxParameters& parameters)
+     {
+-        if (!IsRecoveryAdmissionOpen())
++        if (m_ExecutionMode == ExecutionMode::Offline || !parameters.GetTxID() || IsOfflineTransaction(*parameters.GetTxID()) || !IsRecoveryAdmissionOpen())
+             throw std::runtime_error("Beam recovery admission deferred");
+         auto tx = ConstructTransactionFromParameters(parameters);
+         if (!tx)
+@@ -529,6 +536,7 @@
+ 
+     void Wallet::ResumeAllTransactions()
+     {
++        if (m_ExecutionMode == ExecutionMode::Offline) return;
+         if (m_RecoveryPolicy && (m_RecognitionRecovery.m_RollbackPending ||
+             m_RecognitionRecovery.m_Phase == RecognitionRecovery::Reset))
+         {
+@@ -1336,6 +1344,7 @@
+ 
+     void Wallet::CancelTransaction(const TxID& txId)
+     {
++        if (IsOfflineTransaction(txId)) return;
+         BEAM_LOG_INFO() << txId << " Canceling tx";
+ 
+         if (auto it = m_ActiveTransactions.find(txId); it != m_ActiveTransactions.end())
+@@ -1350,6 +1359,7 @@
+ 
+     void Wallet::DeleteTransaction(const TxID& txId)
+     {
++        if (IsOfflineTransaction(txId)) return;
+         BEAM_LOG_INFO() << "deleting tx " << txId;
+         if (auto it = m_ActiveTransactions.find(txId); it == m_ActiveTransactions.end())
+         {
+@@ -1424,6 +1434,18 @@
+             // Recovery proof requests cannot call a transaction object or failure transition.
+             m_RecoveryProofHeights[r.m_TxID] = r.m_Res.m_Proof.empty() ? 0 : r.m_Res.m_Proof.m_State.get_Height();
+             return;
++        }
++        if (IsOfflineTransaction(r.m_TxID))
++        {
++            auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++            try
++            {
++                const Height h = r.m_Res.m_Proof.empty() ? 0 : r.m_Res.m_Proof.m_State.get_Height();
++                storage::setTxParameter(*db, r.m_TxID, TxParameterID::KernelProofHeight, h, false);
++                db->FlushNow();
++            }
++            catch (...) { db->RollbackNow(false); throw; }
++            return; // no status/failure/rollback/reservation transitions
+         }
+         if (!r.m_Res.m_Proof.empty())
+             m_WalletDB->get_History().AddStates(&r.m_Res.m_Proof.m_State, 1); // why not?
+@@ -2166,8 +2188,106 @@
+ #endif
+     }
+ 
++    bool Wallet::IsOfflineTransaction(const TxID& id) const
++    {
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!db) return true;
++        try
++        {
++            bool offline = false;
++            const auto hex = to_hex(id.data(), id.size());
++            for (const auto& entry : db->getBlobsByPrefix("beam.sdk.kmp.send.v"))
++            {
++                const auto j = nlohmann::json::parse(entry.second.begin(), entry.second.end());
++                if (entry.first.find("beam.sdk.kmp.send.v1.") != 0 ||
++                    j.find("txId") == j.end() || !j.at("txId").is_string()) return true;
++                if (j.find("version") == j.end())
++                {
++                    if (j.find("mode") != j.end()) return true;
++                    const auto state = j.at("state").get<std::string>();
++                    if (state != "Prepared" && state != "Committing" && state != "Submitted") return true;
++                    continue; // unchanged legacy online record
++                }
++                if (j.at("version") != 2 || j.at("mode") != "Offline") return true;
++                const auto state = j.at("state").get<std::string>();
++                if (state != "Signing" && state != "Signed" && state != "Exported") return true;
++                if (j.at("txId") == hex) offline = true;
++            }
++            return offline;
++        }
++        catch (...) { return true; } // no parser diagnostics / receiver material
++    }
++
++    bool Wallet::IsOfflineSigningIntent(const TxID& id) const
++    {
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (!db) return false;
++        try
++        {
++            const auto hex = to_hex(id.data(), id.size());
++            for (const auto& entry : db->getBlobsByPrefix("beam.sdk.kmp.send.v"))
++            {
++                const auto j = nlohmann::json::parse(entry.second.begin(), entry.second.end());
++                if (j.at("txId") == hex)
++                    return j.at("version") == 2 && j.at("mode") == "Offline" && j.at("state") == "Signing";
++            }
++        }
++        catch (...) {}
++        return false;
++    }
++
++    void Wallet::RequestOfflineKernelProofs()
++    {
++        if (m_ExecutionMode == ExecutionMode::Offline || !IsRecoveryAdmissionOpen()) return;
++        for (const auto& tx : m_WalletDB->getTxHistory(TxType::ALL))
++        {
++            Merkle::Hash kernel;
++            if (!IsOfflineTransaction(tx.m_txId) || !tx.GetParameter(TxParameterID::KernelID, kernel)) continue;
++            MyRequestKernel::Ptr request(new MyRequestKernel);
++            request->m_TxID = tx.m_txId;
++            request->m_Msg.m_ID = kernel;
++            PostReqUnique(*request); // chain observation only, never a transaction creator
++        }
++    }
++
++    BaseTransaction::Ptr Wallet::BeginOfflineTransaction(const TxParameters& parameters,
++        INegotiatorGateway& gateway, BaseTransaction::Creator::Ptr creator,
++        std::function<bool()> admission)
++    {
++        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
++        if (m_ExecutionMode != ExecutionMode::Offline || m_NodeEndpoint || !m_MessageEndpoints.empty() ||
++            m_OfflineTransaction || !db || !db->IsSelectionAllowed() || !parameters.GetTxID() ||
++            !IsOfflineSigningIntent(*parameters.GetTxID()) || !admission || !admission())
++            throw std::runtime_error("Offline capability admission failed");
++        const auto id = *parameters.GetTxID();
++        // The SDK has validated the complete inventory and flushed its intent already.
++        // A retry resumes the original row, never repeats voucher preparation or rewrites keys.
++        if (!db->getTx(id))
++        {
++            auto completed = creator->CheckAndCompleteParameters(parameters);
++            auto tx = creator->Create(BaseTransaction::TxContext(*this, gateway, id));
++            ApplyTransactionParameters(tx, completed.Pack(), true);
++            db->FlushNow();
++            m_OfflineTransaction = std::move(tx);
++        }
++        else m_OfflineTransaction = creator->Create(BaseTransaction::TxContext(*this, gateway, id));
++        m_OfflineAdmission = std::move(admission);
++        return m_OfflineTransaction;
++    }
++
++    void Wallet::EndOfflineTransaction()
++    {
++        if (m_OfflineTransaction) m_OfflineTransaction->Retire();
++        m_OfflineAdmission = {};
++        m_OfflineTransaction.reset();
++    }
++
+     bool Wallet::CanProcessTransaction(const BaseTransaction& tx) const
+     {
++        if (m_ExecutionMode == ExecutionMode::Offline)
++            return m_OfflineTransaction.get() == &tx && tx.InstanceEpoch() == m_TransactionEpoch &&
++                m_OfflineAdmission && m_OfflineAdmission();
++        if (IsOfflineTransaction(tx.GetTxID())) return false;
+         if (!m_RecoveryPolicy) return true;
+         auto it = m_ActiveTransactions.find(tx.GetTxID());
+         return m_RecoveryAdmission && tx.InstanceEpoch() == m_TransactionEpoch &&
+@@ -2176,6 +2296,7 @@
+ 
+     bool Wallet::AllowRequest(const Request& request) const
+     {
++        if (m_ExecutionMode == ExecutionMode::Offline) return false;
+         if (!m_RecoveryPolicy || m_RecoveryAdmission) return true;
+         if (request.m_RecoveryProof && request.get_Type() == Request::Type::Kernel)
+             return m_RecoveryQuorumConfigured && m_RecoveryLiveTip && !m_RecoveryFailure;
+@@ -2378,7 +2499,11 @@
+                 if (proof.second)
+                     storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, proof.second, false);
+                 else
++                {
++                    if (IsOfflineTransaction(proof.first))
++                        storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, Height(0), false);
+                     storage::setTxParameter(*db, proof.first, TxParameterID::KernelUnconfirmedHeight, tip.get_Height(), false);
++                }
+             }
+             if (m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay)
+             {
+@@ -3001,6 +3126,11 @@
+         auto txs = m_WalletDB->getTxHistory(TxType::ALL); // get list of ALL transactions
+         for (auto& tx : txs)
+         {
++            if (IsOfflineTransaction(tx.m_txId))
++            {
++                storage::setTxParameter(*m_WalletDB, tx.m_txId, TxParameterID::KernelProofHeight, Height(0), false);
++                continue;
++            }
+             // For all transactions that are not currently in the 'active' tx list
+             if (m_ActiveTransactions.find(tx.m_txId) == m_ActiveTransactions.end())
+             {
+@@ -3182,6 +3312,7 @@
+         RequestBodies();
+         RequestEvents();
+         RequestStateSummary();
++        RequestOfflineKernelProofs();
+ 
+         for (auto& tx : m_NextTipTransactionToUpdate)
+         {
+@@ -3215,6 +3346,7 @@
+         m_RecoveryLiveTip = true;
+         BEAM_LOG_INFO() << "Tip has not been changed";
+ 
++        RequestOfflineKernelProofs();
+         RequestBodies();
+ 
+         CheckSyncDone();
+@@ -3463,6 +3595,7 @@
+ 
+     void Wallet::OnTransactionMsg(const WalletID& myID, const SetTxParameter& msg)
+     {
++        if (IsOfflineTransaction(msg.m_TxID)) return;
+         //
+         // Extend Auto addresses
+         //
+@@ -3602,6 +3735,7 @@
+ 
+     BaseTransaction::Ptr Wallet::ConstructTransaction(const TxID& id, TxType type)
+     {
++        if (IsOfflineTransaction(id) || m_ExecutionMode == ExecutionMode::Offline) return {};
+         auto it = m_TxCreators.find(type);
+         if (it == m_TxCreators.end())
+         {
+@@ -3614,6 +3748,7 @@
+ 
+     BaseTransaction::Ptr Wallet::ConstructTransactionFromParameters(const TxParameters& parameters)
+     {
++        if (!parameters.GetTxID() || IsOfflineTransaction(*parameters.GetTxID()) || m_ExecutionMode == ExecutionMode::Offline) return {};
+         auto type = parameters.GetParameter<TxType>(TxParameterID::TransactionType);
+         if (!type)
+         {
+@@ -3721,6 +3856,8 @@
+ 
+     void Wallet::RestoreTransactionFromShieldedCoin(ShieldedCoin& coin)
+     {
++        if ((coin.m_createTxId && IsOfflineTransaction(*coin.m_createTxId)) ||
++            (coin.m_spentTxId && IsOfflineTransaction(*coin.m_spentTxId))) return;
+         // add virtual transaction for receiver
+         storage::restoreTransactionFromShieldedCoin(*m_WalletDB, coin, *this);
+     }
+diff --git a/wallet/core/base_transaction.cpp b/wallet/core/base_transaction.cpp
+--- a/wallet/core/base_transaction.cpp
++++ b/wallet/core/base_transaction.cpp
+@@ -225,6 +225,7 @@
+ 
+     void BaseTransaction::Cancel()
+     {
++        if (m_Context.get_Wallet().IsOfflineTransaction(GetTxID())) return;
+         TxStatus s = TxStatus::Pending;
+         GetParameter(TxParameterID::Status, s);
+         // TODO: add CanCancel() method
+@@ -425,6 +426,12 @@
+     {
+         if (!CanProcess())
+             return;
++        if (m_Context.get_Wallet().IsOfflineTransaction(GetTxID()))
++        {
++            Retire(); // failure is observation only: never rollback inputs or notify a peer
++            GetGateway().on_tx_failed(GetTxID());
++            return;
++        }
+         BEAM_LOG_ERROR() << m_Context << " Failed. " << GetFailureMessage(reason);
+ 
+         if (notify)

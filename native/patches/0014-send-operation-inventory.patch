@@ -1,0 +1,96 @@
+diff --git a/wallet/core/wallet_db.h b/wallet/core/wallet_db.h
+index aec686b..1ed033a 100644
+--- a/wallet/core/wallet_db.h
++++ b/wallet/core/wallet_db.h
+@@ -750,6 +750,8 @@ namespace beam::wallet
+         bool getPrivateVarRaw(const char* name, void* data, int size) const override;
+ 
+         bool getBlob(const char* name, ByteBuffer& var) const override;
++        // Materialize variables on this connection before callers reconcile any rows.
++        std::vector<std::pair<std::string, ByteBuffer>> getBlobsByPrefix(const std::string& prefix) const;
+         Height getCurrentHeight() const override;
+         void rollbackConfirmedUtxo(Height minHeight) override;
+         void rollbackAssets(Height minHeight) override;
+@@ -892,6 +894,10 @@ namespace beam::wallet
+         // Deterministically force the next FlushNow COMMIT to fail after a transaction has
+         // accumulated changes. Only compiled into the dedicated native regression-test build.
+         void FailCurrentTransactionForTests();
++        void FailNextFlushForTests() { s_FailingWalletForTests = this; }
++        void FailVariableWritesForTests(const std::string& name);
++    private:
++        static thread_local WalletDB* s_FailingWalletForTests;
+ #endif
+ 
+     private:
+diff --git a/wallet/core/wallet_db.cpp b/wallet/core/wallet_db.cpp
+index 7facfa6..5421e9d 100644
+--- a/wallet/core/wallet_db.cpp
++++ b/wallet/core/wallet_db.cpp
+@@ -3785,6 +3785,22 @@ namespace beam::wallet
+         return false;
+     }
+ 
++    std::vector<std::pair<std::string, ByteBuffer>> WalletDB::getBlobsByPrefix(const std::string& prefix) const
++    {
++        sqlite::Statement stm(this, "SELECT name, value FROM " VARIABLES_NAME
++            " WHERE substr(name, 1, length(?1)) = ?1 COLLATE BINARY ORDER BY name COLLATE BINARY;");
++        stm.bind(1, prefix);
++        std::vector<std::pair<std::string, ByteBuffer>> result;
++        while (stm.step())
++        {
++            ByteBuffer name, value;
++            stm.get(0, name);
++            stm.get(1, value);
++            result.emplace_back(std::string(name.begin(), name.end()), std::move(value));
++        }
++        return result;
++    }
++
+     Timestamp WalletDB::getLastUpdateTime() const
+     {
+         Timestamp timestamp = {};
+@@ -5820,8 +5836,19 @@ namespace beam::wallet
+         return true;
+     }
+ 
++#ifdef BEAM_SDK_KMP_TESTS
++    thread_local WalletDB* WalletDB::s_FailingWalletForTests = nullptr;
++#endif
++
+     void WalletDB::flushDB()
+     {
++#ifdef BEAM_SDK_KMP_TESTS
++        if (s_FailingWalletForTests == this && m_DbTransaction)
++        {
++            s_FailingWalletForTests = nullptr;
++            FailCurrentTransactionForTests();
++        }
++#endif
+         if (m_IsFlushPending)
+         {
+             assert(m_FlushTimer);
+@@ -5892,6 +5919,24 @@ namespace beam::wallet
+     }
+ 
+ #ifdef BEAM_SDK_KMP_TESTS
++    void WalletDB::FailVariableWritesForTests(const std::string& name)
++    {
++        FlushNow();
++        throwIfError(sqlite3_exec(_db,
++            "CREATE TEMP TABLE IF NOT EXISTS sdk_write_failure(name TEXT);"
++            "DELETE FROM sdk_write_failure;"
++            "CREATE TEMP TRIGGER IF NOT EXISTS sdk_fail_insert BEFORE INSERT ON " VARIABLES_NAME
++            " WHEN NEW.name IN (SELECT name FROM sdk_write_failure)"
++            " BEGIN SELECT RAISE(ABORT, 'Synthetic variable write failure'); END;"
++            "CREATE TEMP TRIGGER IF NOT EXISTS sdk_fail_delete BEFORE DELETE ON " VARIABLES_NAME
++            " WHEN OLD.name IN (SELECT name FROM sdk_write_failure)"
++            " BEGIN SELECT RAISE(ABORT, 'Synthetic variable write failure'); END;",
++            nullptr, nullptr, nullptr), _db);
++        sqlite::Statement stm(static_cast<const WalletDB*>(this), "INSERT INTO sdk_write_failure VALUES(?1);");
++        stm.bind(1, name);
++        stm.step();
++    }
++
+     void WalletDB::FailCurrentTransactionForTests()
+     {
+         if (!m_DbTransaction)

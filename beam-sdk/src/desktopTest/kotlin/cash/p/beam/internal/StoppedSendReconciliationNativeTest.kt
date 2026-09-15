@@ -1,5 +1,11 @@
 package cash.p.beam.internal
 
+import cash.p.beam.BeamNetwork
+import cash.p.beam.BeamSdkConfig
+import cash.p.beam.BeamSendResolution
+import cash.p.beam.BeamWalletFactory
+import cash.p.beam.BeamWalletState
+import kotlinx.coroutines.test.runTest
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.deleteIfExists
@@ -8,12 +14,51 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assume.assumeNoException
 
 class StoppedSendReconciliationNativeTest {
+    @Test
+    fun reopenedInventory_mapsDurableMetadataWhileStoppedWithoutRecovery() = runTest {
+        NativeLibraryLoader.load()
+        val directory = Files.createTempDirectory("beam-sdk-send-inventory-")
+        val key = ByteArray(32) { (0x51 + it).toByte() }
+        val seed = ByteArray(64) { (0x61 + it).toByte() }
+        var handle = 0L
+        try {
+            handle = BeamNative.create(directory.toString(), key, seed, 1, -1, "", 0)
+            val transactionId = seedPreparedSend(handle)
+            BeamNative.close(handle)
+            handle = 0L
+            val session = BeamWalletFactory().openExisting(BeamSdkConfig(BeamNetwork.Testnet, directory.toString()), key)
+            try {
+                assertIs<BeamWalletState.Stopped>(session.state.value)
+                val operation = session.sendOperations().single()
+                assertEquals(OPERATION_ID, operation.operationId)
+                assertEquals(transactionId, operation.transactionId)
+                assertEquals(64, operation.requestHash.length)
+                assertTrue(operation.amount > 0 && operation.fee > 0)
+                assertEquals(BeamSendResolution.Prepared(transactionId), operation.resolution)
+                assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
+                assertEquals(operation, session.sendOperations().single())
+                assertTrue(session.abortPrepared(OPERATION_ID))
+                assertTrue(session.sendOperations().isEmpty())
+            } finally {
+                session.close()
+            }
+            assertFailsWith<IllegalStateException> { session.sendOperations() }
+        } finally {
+            if (handle != 0L) runCatching { BeamNative.close(handle) }
+            seed.fill(0)
+            key.fill(0)
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun newWalletBirthday_rejectsStaleTipButAcceptsNormalBlockLag() {
         NativeLibraryLoader.load()

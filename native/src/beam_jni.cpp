@@ -1,4 +1,6 @@
 #include <jni.h>
+#include "offline_context.h"
+#include "offline_signer.h"
 
 #include "core/block_crypt.h"
 #include "wallet/client/wallet_client.h"
@@ -112,6 +114,9 @@ enum class SendState {
     Prepared,
     Committing,
     Submitted,
+    Signing,
+    Signed,
+    Exported,
 };
 
 class SendAdmissionDeferred final : public std::runtime_error {
@@ -129,6 +134,11 @@ struct SendRecord {
     std::uint64_t fee = 0;
     std::int64_t previewVersion = 0;
     SendState state = SendState::Prepared;
+    bool offline = false, maximum = false;
+    std::string contextId, rules, quoteVersion, rawHex, serializedHash, mainKernelId;
+    beam::ByteBuffer inputs, shieldedInputs;
+    std::uint64_t explicitFee = 0;
+    bool isOffline() const { return offline; }
 };
 
 struct SnapshotImportResult {
@@ -169,6 +179,10 @@ class Session;
 
 class BridgeWalletClient final : public WalletClient {
 public:
+#ifdef BEAM_SDK_KMP_TESTS
+    Wallet::Ptr walletForTests;
+    Wallet::Ptr getWallet() { return walletForTests ? walletForTests : WalletClient::getWallet(); }
+#endif
     BridgeWalletClient(
         Session& owner,
         const Rules& rules,
@@ -215,6 +229,9 @@ const char* sendStateName(SendState state) {
         case SendState::Prepared: return "Prepared";
         case SendState::Committing: return "Committing";
         case SendState::Submitted: return "Submitted";
+        case SendState::Signing: return "Signing";
+        case SendState::Signed: return "Signed";
+        case SendState::Exported: return "Exported";
     }
     return "Committing";
 }
@@ -223,6 +240,9 @@ SendState parseSendState(const std::string& value) {
     if (value == "Prepared") return SendState::Prepared;
     if (value == "Committing") return SendState::Committing;
     if (value == "Submitted") return SendState::Submitted;
+    if (value == "Signing") return SendState::Signing;
+    if (value == "Signed") return SendState::Signed;
+    if (value == "Exported") return SendState::Exported;
     throw std::runtime_error("Unknown durable send state");
 }
 
@@ -354,25 +374,83 @@ void saveSendRecord(IWalletDB& database, const SendRecord& record) {
         {"previewVersion", record.previewVersion},
         {"state", sendStateName(record.state)},
     };
+    if (!record.isOffline() && record.explicitFee) json["explicitFee"] = record.explicitFee;
+    if (record.isOffline()) {
+        json["version"] = 2; json["mode"] = "Offline";
+        json["contextId"] = record.contextId; json["rules"] = record.rules;
+        json["quoteVersion"] = record.quoteVersion; json["maximum"] = record.maximum;
+        json["explicitFee"] = record.explicitFee; json["rawHex"] = record.rawHex;
+        json["serializedHash"] = record.serializedHash; json["mainKernelId"] = record.mainKernelId;
+        json["inputs"] = record.inputs; json["shieldedInputs"] = record.shieldedInputs;
+    }
     auto text = json.dump();
     auto key = sendRecordKey(record.operationId);
     setRawString(database, key.c_str(), text);
+}
+
+SendRecord decodeSendRecord(const std::string& key, const std::string& text) {
+    try {
+        auto json = Json::parse(text);
+        SendRecord record;
+        record.operationId = json.at("operationId").get<std::string>();
+        record.txId = json.at("txId").get<std::string>();
+        record.receiver = json.at("receiver").get<std::string>();
+        record.comment = json.at("comment").get<std::string>();
+        record.requestHash = json.at("requestHash").get<std::string>();
+        record.amount = json.at("amount").get<std::uint64_t>();
+        record.fee = json.at("fee").get<std::uint64_t>();
+        record.previewVersion = json.at("previewVersion").get<std::int64_t>();
+        record.state = parseSendState(json.at("state").get<std::string>());
+        if (json.find("version") != json.end()) {
+            if (json.at("version") != 2 || json.at("mode") != "Offline") throw std::runtime_error("Unknown mode");
+            record.offline = true;
+            record.contextId = json.at("contextId").get<std::string>();
+            record.rules = json.at("rules").get<std::string>();
+            record.quoteVersion = json.at("quoteVersion").get<std::string>();
+            record.maximum = json.at("maximum").get<bool>();
+            record.explicitFee = json.at("explicitFee").get<uint64_t>();
+            record.rawHex = json.at("rawHex").get<std::string>();
+            record.serializedHash = json.at("serializedHash").get<std::string>();
+            record.mainKernelId = json.at("mainKernelId").get<std::string>();
+            record.inputs = json.at("inputs").get<beam::ByteBuffer>();
+            record.shieldedInputs = json.at("shieldedInputs").get<beam::ByteBuffer>();
+            if (record.contextId.empty() || record.rules.empty() || record.quoteVersion.size() != 64 ||
+                !record.explicitFee || record.explicitFee > record.fee ||
+                record.receiver.size() > beam::sdk::kMaxTokenChars ||
+                record.rawHex.size() > 2 * beam::sdk::kMaxTransactionBytes ||
+                record.rawHex.size() % 2 || record.rawHex.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                record.inputs.size() > beam::sdk::kMaxTransactionBytes || record.shieldedInputs.size() > beam::sdk::kMaxTransactionBytes ||
+                (record.state != SendState::Signing && record.state != SendState::Signed && record.state != SendState::Exported) ||
+                (record.state == SendState::Signing ? !record.rawHex.empty() :
+                    (record.rawHex.empty() || record.mainKernelId.size() != 64 || record.serializedHash.size() != 64)))
+                throw std::runtime_error("Invalid offline record");
+        } else if (json.find("mode") != json.end() || record.state == SendState::Signing ||
+            record.state == SendState::Signed || record.state == SendState::Exported) throw std::runtime_error("Unknown mode");
+        if (!record.isOffline() && json.find("explicitFee") != json.end()) {
+            record.explicitFee = json.at("explicitFee").get<uint64_t>();
+            if (!record.explicitFee || record.explicitFee > record.fee) throw std::runtime_error("Invalid explicit fee");
+        }
+        if (record.operationId.empty() || record.operationId.find('\0') != std::string::npos ||
+            key != sendRecordKey(record.operationId) || record.txId.size() != 32 ||
+            record.txId.find_first_not_of("0123456789abcdef") != std::string::npos ||
+            !json.at("amount").is_number_unsigned() || !json.at("fee").is_number_unsigned() ||
+            !record.amount || !record.fee || record.fee > kMaxJavaLong || record.amount > kMaxJavaLong - record.fee ||
+            stableDigest(record.receiver + "\n" + std::to_string(record.amount) + "\n" +
+                record.comment + "\n" + std::to_string(record.fee)).second != record.requestHash) {
+            throw std::runtime_error("Invalid send record");
+        }
+        return record;
+    } catch (...) {
+        // JSON diagnostics may contain receiver tokens or comments. Never send them to JNI logging.
+        throw std::runtime_error("Durable Beam send inventory is invalid or unsupported");
+    }
 }
 
 bool loadSendRecord(const IWalletDB& database, const std::string& operationId, SendRecord& record) {
     std::string text;
     auto key = sendRecordKey(operationId);
     if (!getRawString(database, key.c_str(), text)) return false;
-    auto json = Json::parse(text);
-    record.operationId = json.at("operationId").get<std::string>();
-    record.txId = json.at("txId").get<std::string>();
-    record.receiver = json.at("receiver").get<std::string>();
-    record.comment = json.at("comment").get<std::string>();
-    record.requestHash = json.at("requestHash").get<std::string>();
-    record.amount = json.at("amount").get<std::uint64_t>();
-    record.fee = json.at("fee").get<std::uint64_t>();
-    record.previewVersion = json.at("previewVersion").get<std::int64_t>();
-    record.state = parseSendState(json.at("state").get<std::string>());
+    record = decodeSendRecord(key, text);
     return true;
 }
 
@@ -438,13 +516,14 @@ TxParameters makeSendParameters(const SendRecord& record) {
     if (!receiverParameters) throw std::invalid_argument("Receiver token is invalid");
     auto type = requireOneSidedAddress(record.receiver);
     auto txId = parseTxId(record.txId);
-    auto parameters = beam::wallet::CreateSimpleTransactionParameters(txId);
+    auto parameters = record.isOffline() ? beam::wallet::lelantus::CreatePushTransactionParameters(txId) :
+        beam::wallet::CreateSimpleTransactionParameters(txId);
     if (!beam::wallet::LoadReceiverParams(*receiverParameters, parameters, type)) {
         throw std::invalid_argument("Receiver token does not contain required parameters");
     }
     parameters
         .SetParameter(TxParameterID::Amount, Amount(record.amount))
-        .SetParameter(TxParameterID::Fee, Amount(record.fee))
+        .SetParameter(TxParameterID::Fee, Amount(record.explicitFee ? record.explicitFee : record.fee))
         .SetParameter(TxParameterID::AssetID, Asset::s_BeamID)
         .SetParameter(
             TxParameterID::Message,
@@ -578,6 +657,7 @@ public:
             }
         );
         if (!database_) throw std::runtime_error("Unable to create encrypted Beam WalletDB");
+        initializeOfflineContext();
     }
 
     void open(const std::vector<std::uint8_t>& keyBytes) {
@@ -641,7 +721,24 @@ public:
         } else {
             bootstrap_ = RestoreKind::Existing;
             bootstrapInitialized_ = true;
+            // No WalletClient owns the DB yet. Reuse the live history conversion while
+            // leaving status, connectivity and balance readiness to network startup.
+            // Uninitialized restores must not publish partially imported history here.
+            onTransactions(ChangeAction::Reset, database_->getTxHistory(TxType::ALL));
         }
+        initializeOfflineContext();
+    }
+
+    void initializeOfflineContext() {
+        offlineContext_ = std::make_shared<beam::sdk::OfflineContext>(
+            std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_), network_,
+            [this](const beam::sdk::OfflineContext::State& state) {
+                // Core bootstrap/recovery can notify while Session already holds mutex_.
+                // This independent snapshot lock avoids re-entering that lifecycle mutex.
+                std::lock_guard<std::mutex> lock(offlineStateMutex_);
+                offlineState_ = state;
+            });
+        offlineContext_->load();
     }
 
     void setRestoreSource(IWalletDB& database, int type, const std::string& value) {
@@ -736,6 +833,8 @@ public:
         ownerThreadStopped_.wait(lock, [this]() { return !ownerThreadStopping_; });
         requireDatabase();
         if (client_) return;
+        { Rules::Scope rules(rules_); sendRecordsOnWalletThread(); }
+        if (offlineContext_) offlineContext_->resume();
         snapshot_.phase = Phase::Connecting;
         snapshot_.failureMessage.clear();
         snapshot_.failureRetryable = true;
@@ -783,6 +882,19 @@ public:
                         throw std::runtime_error("Beam recovery quorum could not be initialized");
                     }
                     network->SetRecoveryQuorum(true);
+                    std::weak_ptr<beam::sdk::OfflineContext> context = self->offlineContext_;
+                    std::weak_ptr<Wallet> contextWallet = wallet;
+                    std::weak_ptr<beam::proto::FlyClient::NetworkStd> contextNetwork = network;
+                    wallet->m_OfflineContextChanged = [context, contextWallet, contextNetwork](bool synced) {
+                        auto cache = context.lock();
+                        auto wallet = contextWallet.lock();
+                        auto network = contextNetwork.lock();
+                        if (!cache) return;
+                        if (!synced) cache->invalidate();
+                        else if (wallet && network && wallet->IsRecoveryAdmissionOpen()) cache->prepare(*network);
+                    };
+                    if (wallet->IsRecoveryAdmissionOpen() && configuredClient->isSynced())
+                        self->offlineContext_->prepare(*network);
                     std::weak_ptr<Session> weak = self;
                     wallet->SetBodyQuorumFailureHandler([weak](const std::string& message) {
                         if (auto session = weak.lock()) session->onQuorumError(message);
@@ -813,6 +925,7 @@ public:
                     // Preserve the original start failure.
                 }
             }
+            if (offlineContext_) offlineContext_->stop();
             lock.lock();
             if (snapshotImportPending_ && database_) {
                 try {
@@ -835,7 +948,9 @@ public:
         {
             std::unique_lock<std::mutex> lock(mutex_);
             ownerThreadStopped_.wait(lock, [this]() { return !ownerThreadStopping_; });
+            if (offlineContext_) offlineContext_->requestStop();
             if (!client_) {
+                if (offlineContext_) offlineContext_->stop();
                 connected_ = false;
                 bootstrapStarted_ = false;
                 snapshot_.phase = Phase::Stopped;
@@ -852,6 +967,7 @@ public:
         } catch (...) {
             failure = std::current_exception();
         }
+        if (offlineContext_) offlineContext_->stop(); // reactor joined: detach remaining callbacks
         {
             std::lock_guard<std::mutex> lock(mutex_);
             try {
@@ -871,6 +987,7 @@ public:
     }
 
     void close() {
+        offlineClosing_.store(true);
         stop();
         std::lock_guard<std::mutex> lock(mutex_);
         if (database_) {
@@ -878,9 +995,12 @@ public:
             beam::io::Reactor::Scope reactorScope(*reactor_);
             flushDatabase(database_);
         }
+        offlineContext_.reset();
         database_.reset();
         reactor_.reset();
         snapshot_ = NativeSnapshot{};
+        std::lock_guard<std::mutex> contextLock(offlineStateMutex_);
+        offlineState_ = {};
     }
 
     std::string snapshotJson() const {
@@ -901,6 +1021,21 @@ public:
             {"failureRetryable", snapshot_.failureRetryable},
             {"failureKind", snapshot_.failureKind},
         };
+        using ContextPhase = beam::sdk::OfflineContext::Phase;
+        beam::sdk::OfflineContext::State context;
+        {
+            std::lock_guard<std::mutex> contextLock(offlineStateMutex_);
+            context = offlineState_;
+        }
+        const char* contextPhase = "Unavailable";
+        switch (context.phase) {
+            case ContextPhase::Unavailable: break;
+            case ContextPhase::Preparing: contextPhase = "Preparing"; break;
+            case ContextPhase::Ready: contextPhase = "Ready"; break;
+            case ContextPhase::Invalidated: contextPhase = "Invalidated"; break;
+        }
+        result["offlineSigning"] = {{"phase", contextPhase}, {"contextId", context.contextId},
+            {"height", context.height}, {"shieldedCount", context.shieldedCount}};
         if (snapshot_.hasRestoreProgress) {
             result["restoreCurrent"] = snapshot_.restoreCurrent;
             result["restoreTarget"] = snapshot_.restoreTarget;
@@ -986,7 +1121,7 @@ public:
             if (!selection.m_isEnought) throw std::runtime_error("Insufficient Beam funds including fee");
             auto fee = selection.get_TotalFee();
             if (amount > kMaxJavaLong - fee) throw std::overflow_error("Send total overflows SDK amount model");
-            auto digest = requestDigest(receiver, amount, comment, fee);
+            auto digest = previewMaterial(receiver, amount, comment);
             return Json({
                 {"requestHash", digest.second},
                 {"previewVersion", digest.first},
@@ -1016,12 +1151,243 @@ public:
         });
     }
 
+
+    std::string quoteSend(const std::string& receiver, uint64_t amount, bool maximum,
+        const std::string& comment, const std::string& contextId) {
+        return invokeOrUseStoppedDatabase<std::string>([this, receiver, amount, maximum, comment, contextId] {
+            if (comment.size() > 1024) throw std::invalid_argument("Comment exceeds SDK limit");
+            auto db = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+            sendRecordsOnWalletThread();
+            if (contextId.empty()) {
+                if (!client_) throw beam::sdk::SendError("SEND_BUSY", "Online quote requires a running owner");
+                requireRecoveryAdmissionOnWalletThread();
+            }
+            else {
+                if (client_) throw beam::sdk::SendError("SEND_BUSY", "Offline quote requires a stopped owner");
+                if (!offlineContext_) throw beam::sdk::SendError("CONTEXT_UNAVAILABLE", "Missing offline context");
+                beam::sdk::SigningContext::capture(db, *offlineContext_, contextId);
+            }
+            auto q = beam::sdk::quoteSend(db, receiver, amount, maximum, comment, contextId);
+            return Json({{"amount", q.selection.m_requestedSum}, {"fee", q.selection.get_TotalFee()},
+                {"total", q.selection.m_requestedSum + q.selection.get_TotalFee()},
+                {"explicitFee", q.selection.m_explicitFee}, {"change", q.selection.m_changeBeam},
+                {"remainder", q.remainder}, {"ordinaryInputs", q.ordinary.size()}, {"shieldedInputs", q.shielded.size()},
+                {"version", q.version}, {"contextId", q.contextId}, {"rules", q.rules},
+                {"receiverType", addressTypeName(q.receiverType)}}).dump();
+        });
+    }
+
+    std::string signOffline(const std::string& operationId, const std::string& receiver, uint64_t amount,
+        bool maximum, const std::string& comment, const std::string& contextId, const std::string& version) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        requireDatabase();
+        if (client_ || ownerThreadStopping_ || offlineClosing_.load())
+            throw beam::sdk::SendError("SEND_BUSY", "Signing requires a drained stopped owner");
+        cancelRequested_.store(false);
+        if (operationId.empty() || operationId.size() > 128 || operationId.find('\0') != std::string::npos ||
+            comment.size() > 1024 || receiver.size() > beam::sdk::kMaxTokenChars)
+            throw std::invalid_argument("Offline request exceeds SDK bounds");
+        Rules::Scope scope(rules_);
+        beam::io::Reactor::Scope reactorScope(*reactor_);
+        auto db = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+        sendRecordsOnWalletThread();
+        SendRecord record;
+        const bool existing = loadSendRecord(*db, operationId, record);
+        if (existing) {
+            if (!record.isOffline() || record.receiver != receiver || record.comment != comment ||
+                record.contextId != contextId || record.quoteVersion != version || record.maximum != maximum ||
+                (!maximum && record.amount != amount))
+                throw beam::sdk::SendError("OPERATION_CONFLICT", "operationId is bound to another request");
+            if (record.state != SendState::Signing) return Json({{"transactionId", record.txId}, {"state", sendStateName(record.state)}}).dump();
+        }
+        if (!offlineContext_) throw beam::sdk::SendError("CONTEXT_UNAVAILABLE", "Missing offline context");
+        const auto context = beam::sdk::SigningContext::capture(db, *offlineContext_, contextId);
+        if (!existing) {
+            requireSendAdmissionOnWalletThread(operationId);
+            const auto q = beam::sdk::quoteSend(db, receiver, amount, maximum, comment, contextId);
+            if (q.version != version) throw beam::sdk::SendError("STALE_QUOTE", "Send quote is stale");
+            record.offline = true; record.maximum = maximum;
+            record.operationId = operationId; record.txId = txIdString(beam::wallet::GenerateTxID());
+            record.receiver = receiver; record.comment = comment; record.amount = q.selection.m_requestedSum;
+            record.fee = q.selection.get_TotalFee(); record.explicitFee = q.selection.m_explicitFee;
+            record.requestHash = requestDigest(receiver, record.amount, comment, record.fee).second;
+            record.contextId = contextId; record.rules = context.rules; record.quoteVersion = version;
+            record.state = SendState::Signing;
+            durableSendWrite([&] { saveSendRecord(*db, record); sendBoundary("offline-intent-record"); });
+            sendBoundary("offline-intent"); // must precede Creator and any resumable Core row
+        } else {
+            const auto own = parseTxId(record.txId);
+            requireSendAdmissionOnWalletThread(operationId, &own);
+            if (record.rules != context.rules) throw beam::sdk::SendError("CONTEXT_UNAVAILABLE", "Signing rules changed");
+        }
+        auto parameters = makeSendParameters(record);
+        parameters.SetParameter(TxParameterID::MinHeight, context.tip.get_Height());
+        beam::sdk::signOffline(db, parameters, context, record.fee, record.explicitFee, record.amount,
+            cancelRequested_, [&](const beam::sdk::SignedMaterial& material) {
+                auto signedRecord = record;
+                signedRecord.state = SendState::Signed;
+                signedRecord.rawHex = beam::to_hex(material.bytes.data(), material.bytes.size());
+                signedRecord.serializedHash = material.inspection.serializedHash;
+                signedRecord.mainKernelId = material.inspection.mainKernelId;
+                signedRecord.inputs = material.inputs; signedRecord.shieldedInputs = material.shieldedInputs;
+                durableSendWrite([&] { saveSendRecord(*db, signedRecord); sendBoundary("offline-signed-record"); });
+                record = std::move(signedRecord);
+                sendBoundary("offline-signed");
+            }, [&](const char* b) { sendBoundary(b); });
+        return Json({{"transactionId", record.txId}, {"state", sendStateName(record.state)}}).dump();
+    }
+
+    beam::ByteBuffer exportSignedTransaction(const std::string& operationId) {
+        return invokeOrUseStoppedDatabase<beam::ByteBuffer>([this, operationId] {
+            sendRecordsOnWalletThread();
+            SendRecord record;
+            if (!loadSendRecord(*database_, operationId, record) || !record.isOffline() || record.state == SendState::Signing)
+                throw beam::sdk::SendError("SIGNING_INTERRUPTED", "Operation has no durable signed transaction");
+            const auto bytes = beam::from_hex(record.rawHex);
+            validateSendEvidence(record); // same bounded codec as foreign inspection
+            if (record.state != SendState::Exported) {
+                record.state = SendState::Exported;
+                durableSendWrite([&] { saveSendRecord(*database_, record); sendBoundary("offline-exported-record"); });
+            }
+            sendBoundary("offline-exported"); // lost response is already an export
+            return bytes;
+        });
+    }
+
 private:
 #ifdef BEAM_SDK_KMP_TESTS
     friend class SendAdmissionFixture;
+    friend class OfflineHistoryFixture;
+    friend class OfflineSignerFixture;
     unsigned int startTransactionCallsForTests_ = 0;
     std::function<void()> invokeQueuedForTests_;
+    std::function<void(const char*)> sendBoundaryForTests_;
+    bool dropInvokeResponseForTests_ = false;
+    std::chrono::milliseconds invokeTimeoutForTests_{30'000};
 #endif
+
+    template <typename Function>
+    void durableSendWrite(Function&& function) {
+        try {
+            function();
+            flushDatabase(database_);
+        } catch (...) {
+            rollbackDatabase(database_);
+            throw;
+        }
+    }
+
+    void sendBoundary(const char* boundary) {
+#ifdef BEAM_SDK_KMP_TESTS
+        if (sendBoundaryForTests_) sendBoundaryForTests_(boundary);
+#endif
+    }
+
+    void validateSendEvidence(const SendRecord& record) const {
+        try {
+            makeSendParameters(record);
+            if (record.isOffline() && record.state != SendState::Signing) {
+                const auto bytes = beam::from_hex(record.rawHex);
+                const auto inspected = beam::sdk::inspectTransaction(bytes, rules_, record.rules);
+                if (inspected.serializedHash != record.serializedHash || inspected.mainKernelId != record.mainKernelId)
+                    throw std::runtime_error("Invalid signed evidence");
+                beam::ByteBuffer ordinary, shielded;
+                const auto id = parseTxId(record.txId);
+                database_->getTxParameter(id, beam::wallet::kDefaultSubTxID, TxParameterID::InputCoins, ordinary);
+                database_->getTxParameter(id, beam::wallet::kDefaultSubTxID, TxParameterID::InputCoinsShielded, shielded);
+                // Missing empty vectors are represented by the Core serializer, too.
+                if (ordinary != record.inputs || shielded != record.shieldedInputs)
+                    throw std::runtime_error("Signed reservation evidence is missing or conflicting");
+            }
+            const auto transaction = database_->getTx(parseTxId(record.txId));
+            if (transaction && (!transaction->m_sender || transaction->m_amount != record.amount ||
+                transaction->m_fee != (record.explicitFee ? record.explicitFee : record.fee) || transaction->m_assetId != Asset::s_BeamID)) {
+                throw std::runtime_error("Conflicting send evidence");
+            }
+        } catch (...) {
+            throw std::runtime_error("Durable Beam send inventory is invalid or unsupported");
+        }
+    }
+
+    std::vector<SendRecord> sendRecordsOnWalletThread() const {
+        auto database = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+        if (!database) throw std::runtime_error("Beam WalletDB does not support send inventory");
+        const auto variables = database->getBlobsByPrefix("beam.sdk.kmp.send.v");
+        std::vector<SendRecord> records;
+        std::set<std::string> transactionIds;
+        for (const auto& variable : variables) {
+            auto record = decodeSendRecord(variable.first, std::string(variable.second.begin(), variable.second.end()));
+            validateSendEvidence(record);
+            if (!transactionIds.insert(record.txId).second) {
+                throw std::runtime_error("Durable Beam send inventory has conflicting identities");
+            }
+            records.push_back(std::move(record));
+        }
+        std::string active;
+        if (getRawString(*database_, kActiveSendVar, active) && !active.empty() &&
+            std::none_of(records.begin(), records.end(), [&](const auto& record) { return record.operationId == active; })) {
+            throw SendAdmissionDeferred();
+        }
+        return records;
+    }
+
+    Height offlineConfirmation(const SendRecord& record) const {
+        if (!record.isOffline() || record.state == SendState::Signing) return 0;
+        auto db = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+        if (!db->IsSelectionAllowed()) return 0;
+        Height h = 0;
+        const auto id = parseTxId(record.txId);
+        beam::wallet::storage::getTxParameter(*db, id, TxParameterID::KernelProofHeight, h);
+        if (!h || h > db->getCurrentHeight()) return 0;
+        const auto inspected = beam::sdk::inspectTransaction(beam::from_hex(record.rawHex), rules_, record.rules);
+        size_t ordinary = 0, shielded = 0;
+        bool allSpent = true;
+        db->visitCoins([&](const beam::wallet::Coin& c) {
+            if (c.m_spentTxId && *c.m_spentTxId == id) { ++ordinary; allSpent &= c.m_spentHeight == h; }
+            return true;
+        });
+        db->visitShieldedCoins([&](const beam::wallet::ShieldedCoin& c) {
+            if (c.m_spentTxId && *c.m_spentTxId == id) { ++shielded; allSpent &= c.m_spentHeight == h; }
+            return true;
+        });
+        return allSpent && ordinary == inspected.ordinaryInputs && shielded == inspected.shieldedInputs ? h : 0;
+    }
+
+    Json sendOperationsOnWalletThread() {
+        const auto records = sendRecordsOnWalletThread();
+        Json result = Json::array();
+        for (const auto& record : records) {
+            result.push_back({{"operationId", record.operationId}, {"transactionId", record.txId},
+                {"requestHash", record.requestHash}, {"amount", record.amount}, {"fee", record.fee},
+                {"resolution", observeSendOnWalletThread(record)},
+                {"deliveryMode", record.isOffline() ? "Offline" : "Online"},
+                {"offlineState", record.isOffline() ? Json(sendStateName(record.state)) : Json(nullptr)},
+                {"observedProofHeight", offlineConfirmation(record)},
+                {"contextId", record.contextId}, {"rules", record.rules},
+                {"serializedHash", record.serializedHash}, {"mainKernelId", record.mainKernelId}});
+        }
+        return result;
+    }
+
+    std::string recoverSendOperationsOnWalletThread(const Wallet::Ptr& wallet) {
+        requireRecoveryAdmissionOnWalletThread();
+        const auto records = sendRecordsOnWalletThread();
+        // Validate all records and admission before any reconciliation or transaction creation.
+        for (const auto& record : records) {
+            if (record.isOffline()) continue;
+            const auto txId = parseTxId(record.txId);
+            if (!database_->getTx(txId)) requireSendAdmissionOnWalletThread(record.operationId, &txId);
+        }
+        for (auto record : records) {
+            if (record.isOffline()) continue;
+            if (record.state != SendState::Submitted && !database_->getTx(parseTxId(record.txId))) {
+                commitSendOnWalletThread(record.operationId, wallet);
+            } else {
+                resolveSendOnWalletThread(record);
+            }
+        }
+        return sendOperationsOnWalletThread().dump();
+    }
 
     // These helpers, including the history read and first Core side effect, execute in
     // one owner-thread call. Core rollback cannot interleave with admission.
@@ -1031,6 +1397,8 @@ private:
     ) {
         SendRecord existing;
         if (loadSendRecord(*database_, operationId, existing)) {
+            sendRecordsOnWalletThread();
+            if (existing.isOffline()) throw beam::sdk::SendError("OPERATION_CONFLICT", "operationId belongs to offline signing");
             auto expected = requestDigest(receiver, amount, comment, existing.fee);
             if (existing.requestHash != expected.second) {
                 throw std::logic_error("operationId is already bound to another send request");
@@ -1039,7 +1407,7 @@ private:
         }
         requireSendAdmissionOnWalletThread(operationId);
         auto preview = previewMaterial(receiver, amount, comment);
-        if (preview.first != previewVersion) throw std::logic_error("Send preview is stale");
+        if (preview.first != previewVersion) throw beam::sdk::SendError("STALE_QUOTE", "Send preview is stale");
         SendRecord record;
         record.operationId = operationId;
         record.txId = txIdString(beam::wallet::GenerateTxID());
@@ -1047,18 +1415,28 @@ private:
         record.amount = amount;
         record.comment = comment;
         record.fee = previewFee(receiver, amount);
+        CoinsSelectionInfo selection;
+        selection.m_requestedSum = amount;
+        selection.Calculate(database_->getCurrentHeight(), database_, true);
+        record.explicitFee = selection.m_explicitFee;
         record.previewVersion = previewVersion;
         record.requestHash = preview.second;
         record.state = SendState::Prepared;
-        saveSendRecord(*database_, record);
-        setRawString(*database_, kActiveSendVar, operationId);
-        flushDatabase(database_);
+        durableSendWrite([&] {
+            saveSendRecord(*database_, record);
+            sendBoundary("prepare-record");
+            setRawString(*database_, kActiveSendVar, operationId);
+            sendBoundary("prepare-marker");
+        });
+        sendBoundary("prepared");
         return Json({{"transactionId", record.txId}}).dump();
     }
 
     std::string commitSendOnWalletThread(const std::string& operationId, const Wallet::Ptr& wallet) {
+        sendRecordsOnWalletThread();
         SendRecord record;
         if (!loadSendRecord(*database_, operationId, record)) return sendResolution("NotPrepared").dump();
+        if (record.isOffline()) return observeSendOnWalletThread(record).dump();
         if (record.state == SendState::Prepared || record.state == SendState::Committing) {
             requireRecoveryAdmissionOnWalletThread();
         }
@@ -1071,8 +1449,11 @@ private:
         }
         if (record.state == SendState::Prepared) {
             record.state = SendState::Committing;
-            saveSendRecord(*database_, record);
-            flushDatabase(database_);
+            durableSendWrite([&] {
+                saveSendRecord(*database_, record);
+                sendBoundary("committing-record");
+            });
+            sendBoundary("committing");
         }
         if (record.state == SendState::Committing) {
             if (!hasCoreRow) {
@@ -1080,7 +1461,14 @@ private:
 #ifdef BEAM_SDK_KMP_TESTS
                 ++startTransactionCallsForTests_;
 #endif
-                auto startedTxId = wallet->StartTransaction(makeSendParameters(record));
+                TxID startedTxId;
+                try {
+                    sendBoundary("core-start");
+                    startedTxId = wallet->StartTransaction(makeSendParameters(record));
+                } catch (...) {
+                    rollbackDatabase(database_);
+                    throw;
+                }
                 if (startedTxId != txId || !database_->getTx(txId)) {
                     throw std::runtime_error("Beam Core did not durably create the prepared transaction");
                 }
@@ -1088,10 +1476,14 @@ private:
                 // before any reservation or node submission. Therefore a missing row means
                 // no payment side effect occurred and replay remains exactly-once.
                 flushDatabase(database_);
+                sendBoundary("core-created");
             }
             record.state = SendState::Submitted;
-            saveSendRecord(*database_, record);
-            flushDatabase(database_);
+            durableSendWrite([&] {
+                saveSendRecord(*database_, record);
+                sendBoundary("submitted-record");
+            });
+            sendBoundary("submitted");
         }
         return resolveSendOnWalletThread(record).dump();
     }
@@ -1103,27 +1495,42 @@ private:
 
     void requireSendAdmissionOnWalletThread(const std::string& operationId, const TxID* ownTxId = nullptr) {
         requireRecoveryAdmissionOnWalletThread();
+        const auto records = sendRecordsOnWalletThread();
         // The marker is only a journal hint: resolveSend clears it at Terminal,
         // but a later Core rollback can reactivate that very same outgoing TxID.
         for (const auto& transaction : database_->getTxHistory(TxType::ALL)) {
+            const auto offline = std::find_if(records.begin(), records.end(), [&](const auto& r) {
+                return r.isOffline() && parseTxId(r.txId) == transaction.m_txId;
+            });
+            if (offline != records.end() && offlineConfirmation(*offline)) continue;
             if (transaction.m_sender && (!ownTxId || transaction.m_txId != *ownTxId) &&
                 !isTerminal(transaction.m_status)) {
                 throw SendAdmissionDeferred();
             }
         }
-        std::string activeOperation;
-        if (getRawString(*database_, kActiveSendVar, activeOperation) &&
-            !activeOperation.empty() && activeOperation != operationId) {
-            SendRecord active;
-            if (!loadSendRecord(*database_, activeOperation, active)) throw SendAdmissionDeferred();
-            const auto transaction = database_->getTx(parseTxId(active.txId));
-            // A stale terminal marker need not prevent admission. Missing Core evidence
-            // (including Prepared/Committing) remains unresolved, never silently cleared.
+        for (const auto& record : records) {
+            if (ownTxId && record.operationId == operationId && parseTxId(record.txId) == *ownTxId) continue;
+            if (record.isOffline() && offlineConfirmation(record)) continue;
+            const auto transaction = database_->getTx(parseTxId(record.txId));
             if (!transaction || !isTerminal(transaction->m_status)) throw SendAdmissionDeferred();
         }
     }
 
 public:
+    std::string sendOperations() {
+        return invokeOrUseStoppedDatabase<std::string>([this] { return sendOperationsOnWalletThread().dump(); });
+    }
+
+    std::string recoverSendOperations() {
+        return invokeWithClient<std::string>([this](const auto& client) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (snapshot_.phase != Phase::Ready) throw std::logic_error("Beam wallet is not ready");
+            }
+            return recoverSendOperationsOnWalletThread(client->getWallet());
+        });
+    }
+
     std::string resolveSend(const std::string& operationId) {
         return invokeOrUseStoppedDatabase<std::string>([this, operationId]() {
             SendRecord record;
@@ -1136,11 +1543,33 @@ public:
         return invokeOrUseStoppedDatabase<bool>([this, operationId]() {
             SendRecord record;
             if (!loadSendRecord(*database_, operationId, record)) return false;
-            if (record.state != SendState::Prepared) return false;
+            validateSendEvidence(record);
+            if (record.isOffline()) {
+                // The stopped-owner mutex is acquired only after signOffline retires and
+                // destroys its builder/callback membership. No raw bytes leave Signed:
+                // export always flushes Exported first, including a lost response.
+                if (client_ || record.state == SendState::Exported) return false;
+                const auto id = parseTxId(record.txId);
+                durableSendWrite([&] {
+                    database_->restoreCoinsSpentByTx(id);
+                    database_->deleteCoinsCreatedByTx(id);
+                    database_->restoreShieldedCoinsSpentByTx(id);
+                    database_->deleteShieldedCoinsCreatedByTx(id);
+                    database_->deleteTx(id);
+                    database_->removeVarRaw(sendRecordKey(operationId).c_str());
+                    sendBoundary("offline-abort-record");
+                });
+                sendBoundary("offline-aborted");
+                return true;
+            }
+            if (record.state != SendState::Prepared || database_->getTx(parseTxId(record.txId))) return false;
             auto key = sendRecordKey(operationId);
-            database_->removeVarRaw(key.c_str());
-            clearActiveSendIfMatches(operationId);
-            flushDatabase(database_);
+            durableSendWrite([&] {
+                database_->removeVarRaw(key.c_str());
+                sendBoundary("abort-record");
+                clearActiveSendIfMatches(operationId);
+                sendBoundary("abort-marker");
+            });
             return true;
         });
     }
@@ -1155,7 +1584,12 @@ public:
         SendRecord record;
         record.operationId = operationId;
         record.txId = txIdString(beam::wallet::GenerateTxID());
-        record.requestHash = "test-request-hash";
+        record.receiver = beam::wallet::GenerateTokenDefaultAddr(TokenType::Offline, database_, 1);
+        record.amount = 100'000;
+        record.fee = 100'000;
+        const auto digest = requestDigest(record.receiver, record.amount, record.comment, record.fee);
+        record.requestHash = digest.second;
+        record.previewVersion = digest.first;
         record.state = SendState::Prepared;
         saveSendRecord(*database_, record);
         setRawString(*database_, kActiveSendVar, operationId);
@@ -1554,14 +1988,27 @@ private:
                 }
                 return boost::any(std::move(result));
             },
-            [promise](const boost::any& value) {
+            [promise
+#ifdef BEAM_SDK_KMP_TESTS
+             , dropResponse = dropInvokeResponseForTests_
+#endif
+            ](const boost::any& value) {
+#ifdef BEAM_SDK_KMP_TESTS
+                if (dropResponse) return;
+#endif
                 promise->set_value(boost::any_cast<const Result&>(value));
             }
         );
 #ifdef BEAM_SDK_KMP_TESTS
         if (invokeQueuedForTests_) invokeQueuedForTests_();
 #endif
-        if (future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        const auto timeout =
+#ifdef BEAM_SDK_KMP_TESTS
+            invokeTimeoutForTests_;
+#else
+            std::chrono::seconds(30);
+#endif
+        if (future.wait_for(timeout) != std::future_status::ready) {
             throw std::runtime_error("Timed out waiting for Beam owner thread");
         }
         auto result = future.get();
@@ -1591,7 +2038,10 @@ private:
         const std::string& comment
     ) {
         auto fee = previewFee(receiver, amount);
-        return requestDigest(receiver, amount, comment, fee);
+        auto result = requestDigest(receiver, amount, comment, fee);
+        auto db = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
+        result.first = stableDigest(result.second + rules_.get_SignatureStr() + beam::sdk::walletSelectionVersion(*db)).first;
+        return result;
     }
 
     std::pair<std::int64_t, std::string> requestDigest(
@@ -1614,25 +2064,32 @@ private:
         return selection.get_TotalFee();
     }
 
-    Json resolveSendOnWalletThread(SendRecord& record) {
-        auto txId = parseTxId(record.txId);
-        auto transaction = database_->getTx(txId);
+    Json observeSendOnWalletThread(const SendRecord& record) const {
+        if (record.isOffline()) return sendResolution("Indeterminate", record.txId);
+        const auto transaction = database_->getTx(parseTxId(record.txId));
         if (transaction && isTerminal(transaction->m_status)) {
-            clearActiveSendIfMatches(record.operationId);
-            flushDatabase(database_);
             auto status = transactionStatus(transaction->m_status);
             return sendResolution("Terminal", record.txId, status.c_str());
         }
-        if (record.state == SendState::Prepared) return sendResolution("Prepared", record.txId);
-        if (record.state == SendState::Committing && transaction) {
-            record.state = SendState::Submitted;
-            saveSendRecord(*database_, record);
-            flushDatabase(database_);
-            return sendResolution("Submitted", record.txId);
-        }
-        if (record.state == SendState::Committing) return sendResolution("Indeterminate", record.txId);
         if (transaction) return sendResolution("Submitted", record.txId);
+        if (record.state == SendState::Prepared) return sendResolution("Prepared", record.txId);
         return sendResolution("Indeterminate", record.txId);
+    }
+
+    Json resolveSendOnWalletThread(SendRecord& record) {
+        validateSendEvidence(record);
+        if (record.isOffline()) return observeSendOnWalletThread(record);
+        const auto transaction = database_->getTx(parseTxId(record.txId));
+        if (transaction) {
+            durableSendWrite([&] {
+                if (record.state != SendState::Submitted) {
+                    record.state = SendState::Submitted;
+                    saveSendRecord(*database_, record);
+                }
+                if (isTerminal(transaction->m_status)) clearActiveSendIfMatches(record.operationId);
+            });
+        }
+        return observeSendOnWalletThread(record);
     }
 
     void clearActiveSendIfMatches(const std::string& operationId) {
@@ -1866,6 +2323,10 @@ private:
     bool bootstrapBodyScanPending_ = false;
     bool snapshotImportPending_ = false;
     bool bootstrapFailed_ = false;
+    std::atomic<bool> offlineClosing_{false};
+    mutable std::mutex offlineStateMutex_;
+    beam::sdk::OfflineContext::State offlineState_;
+    std::shared_ptr<beam::sdk::OfflineContext> offlineContext_;
     bool recoveryQuorumFailed_ = false;
     bool initialStatusLoaded_ = false;
     bool initialTransactionsLoaded_ = false;
@@ -2090,7 +2551,9 @@ void throwJava(JNIEnv* environment, const std::exception& error) {
     const std::string detail = error.what();
     const char* className = "java/lang/IllegalStateException";
     const char* code = "NATIVE";
-    if (dynamic_cast<const SendAdmissionDeferred*>(&error) != nullptr) {
+    if (auto send = dynamic_cast<const beam::sdk::SendError*>(&error)) {
+        code = send->code;
+    } else if (dynamic_cast<const SendAdmissionDeferred*>(&error) != nullptr) {
         code = "SEND_ADMISSION_DEFERRED";
     } else if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr ||
         dynamic_cast<const std::overflow_error*>(&error) != nullptr) {
@@ -2374,6 +2837,20 @@ Java_cash_p_beam_internal_BeamNative_abortPrepared(
     }, JNI_FALSE);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_cash_p_beam_internal_BeamNative_sendOperations(JNIEnv* environment, jobject, jlong handle) {
+    return jniCall(environment, [&]() {
+        return newJavaString(environment, requireSession(handle)->sendOperations());
+    }, static_cast<jstring>(nullptr));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_cash_p_beam_internal_BeamNative_recoverSendOperations(JNIEnv* environment, jobject, jlong handle) {
+    return jniCall(environment, [&]() {
+        return newJavaString(environment, requireSession(handle)->recoverSendOperations());
+    }, static_cast<jstring>(nullptr));
+}
+
 #ifdef BEAM_SDK_KMP_TESTS
 extern "C" JNIEXPORT jstring JNICALL
 Java_cash_p_beam_internal_BeamNative_seedPreparedSendForTests(
@@ -2443,3 +2920,33 @@ Java_cash_p_beam_internal_BeamNative_newWalletTipFreshForTests(
 }
 #endif
 #endif
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_cash_p_beam_internal_BeamNative_quoteSend(JNIEnv* env, jobject, jlong handle, jstring receiver,
+    jlong amount, jboolean maximum, jstring comment, jstring contextId) {
+    return jniCall(env, [&] {
+        if (amount < 0) throw std::invalid_argument("Negative amount");
+        return newJavaString(env, requireSession(handle)->quoteSend(javaString(env, receiver), amount,
+            maximum, javaString(env, comment), javaString(env, contextId)));
+    }, static_cast<jstring>(nullptr));
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_cash_p_beam_internal_BeamNative_signOffline(JNIEnv* env, jobject, jlong handle, jstring operationId,
+    jstring receiver, jlong amount, jboolean maximum, jstring comment, jstring contextId, jstring version) {
+    return jniCall(env, [&] {
+        if (amount < 0) throw std::invalid_argument("Negative amount");
+        return newJavaString(env, requireSession(handle)->signOffline(javaString(env, operationId),
+            javaString(env, receiver), amount, maximum, javaString(env, comment), javaString(env, contextId),
+            javaString(env, version)));
+    }, static_cast<jstring>(nullptr));
+}
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_cash_p_beam_internal_BeamNative_exportSignedTransaction(JNIEnv* env, jobject, jlong handle, jstring operationId) {
+    return jniCall(env, [&] {
+        const auto bytes = requireSession(handle)->exportSignedTransaction(javaString(env, operationId));
+        auto result = env->NewByteArray(static_cast<jsize>(bytes.size()));
+        if (result) env->SetByteArrayRegion(result, 0, static_cast<jsize>(bytes.size()),
+            reinterpret_cast<const jbyte*>(bytes.data()));
+        return result;
+    }, static_cast<jbyteArray>(nullptr));
+}

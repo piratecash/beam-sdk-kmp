@@ -1,15 +1,24 @@
 package cash.p.beam.internal
 
 import co.touchlab.kermit.Logger
+import cash.p.beam.BeamOfflineSigningState
 import cash.p.beam.BeamAddress
 import cash.p.beam.BeamAddressType
 import cash.p.beam.BeamBalance
 import cash.p.beam.BeamFailure
 import cash.p.beam.BeamNetwork
 import cash.p.beam.BeamSdkConfig
+import cash.p.beam.BeamSendAmount
+import cash.p.beam.BeamSendContext
+import cash.p.beam.BeamQuoteRequest
+import cash.p.beam.BeamSendQuote
+import cash.p.beam.BeamOfflineSignResult
+import cash.p.beam.BeamOfflineSendState
+import cash.p.beam.BeamSendDeliveryMode
 import cash.p.beam.BeamSendPreview
 import cash.p.beam.BeamSendRequest
 import cash.p.beam.BeamSendResolution
+import cash.p.beam.BeamSendOperation
 import cash.p.beam.BeamTransaction
 import cash.p.beam.BeamTransactionDirection
 import cash.p.beam.BeamTransactionStatus
@@ -114,6 +123,9 @@ private class JniBeamBackend : BeamBackend {
             downloadedFile = completedSnapshotPath(config.storagePath)
                 .takeIf(java.nio.file.Files::isRegularFile),
         )
+        mutableSnapshot.value = nativeCall {
+            json.decodeFromString<SnapshotDto>(BeamNative.snapshot(requireHandle())).toDomain()
+        }
         logger.i { "open completed network=${config.network.name} pendingSnapshot=${pendingSnapshot != null}" }
     }
 
@@ -186,9 +198,12 @@ private class JniBeamBackend : BeamBackend {
                 pollJob?.cancelAndJoin()
                 pollJob = null
                 nativeCall { BeamNative.stop(requireHandle()) }
-                mutableSnapshot.value = mutableSnapshot.value.copy(
+                val stopped = nativeCall {
+                    json.decodeFromString<SnapshotDto>(BeamNative.snapshot(requireHandle())).toDomain()
+                }
+                mutableSnapshot.value = stopped.copy(
                     phase = BackendPhase.Stopped,
-                    balance = mutableSnapshot.value.balance.copy(isAuthoritative = false),
+                    balance = stopped.balance.copy(isAuthoritative = false),
                 )
             }
         }
@@ -237,6 +252,26 @@ private class JniBeamBackend : BeamBackend {
         ).map(TransactionDto::toDomain)
     }
 
+    override suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote = ioCall {
+        json.decodeFromString<QuoteDto>(BeamNative.quoteSend(requireHandle(), request.receiverToken,
+            (request.amount as? BeamSendAmount.Exact)?.amount ?: 0, request.amount == BeamSendAmount.Max,
+            request.comment, (request.context as? BeamSendContext.Offline)?.contextId.orEmpty())).toDomain()
+    }
+
+    override suspend fun signOffline(
+        operationId: String, request: BeamQuoteRequest, quoteVersion: String,
+    ): BeamOfflineSignResult = ioCall {
+        val dto = json.decodeFromString<OfflineSignDto>(BeamNative.signOffline(requireHandle(), operationId,
+            request.receiverToken, (request.amount as? BeamSendAmount.Exact)?.amount ?: 0,
+            request.amount == BeamSendAmount.Max, request.comment,
+            (request.context as? BeamSendContext.Offline)?.contextId.orEmpty(), quoteVersion))
+        BeamOfflineSignResult(dto.transactionId, BeamOfflineSendState.valueOf(dto.state))
+    }
+
+    override suspend fun exportSignedTransaction(operationId: String): ByteArray = ioCall {
+        BeamNative.exportSignedTransaction(requireHandle(), operationId)
+    }
+
     override suspend fun previewSend(request: BeamSendRequest): BeamSendPreview = ioCall {
         json.decodeFromString<PreviewDto>(
             BeamNative.previewSend(
@@ -276,6 +311,14 @@ private class JniBeamBackend : BeamBackend {
 
     override suspend fun abortPrepared(operationId: String): Boolean = gate.withLock {
         ioCall { BeamNative.abortPrepared(requireHandle(), operationId) }
+    }
+
+    override suspend fun sendOperations(): List<BeamSendOperation> = gate.withLock {
+        ioCall { BeamNative.sendOperations(requireHandle()).toSendOperations() }
+    }
+
+    override suspend fun recoverSendOperations(): List<BeamSendOperation> = gate.withLock {
+        ioCall { BeamNative.recoverSendOperations(requireHandle()).toSendOperations() }
     }
 
     private suspend fun pollSnapshots() {
@@ -403,6 +446,14 @@ internal fun Throwable.asBeamFailure(): BeamFailure {
     if (this is CancellationException) throw this
     if (this is BeamFailure) return this
     nativeFailure("SEND_ADMISSION_DEFERRED")?.let { return BeamFailure.SendAdmissionDeferred(it, this) }
+    nativeFailure("CONTEXT_UNAVAILABLE")?.let { return BeamFailure.ContextUnavailable(it) }
+    nativeFailure("STALE_QUOTE")?.let { return BeamFailure.StaleQuote(it) }
+    nativeFailure("SEND_BUSY")?.let { return BeamFailure.SendBusy(it) }
+    nativeFailure("INVALID_ADDRESS")?.let { return BeamFailure.InvalidAddress(it) }
+    nativeFailure("QUOTE_UNAVAILABLE")?.let { return BeamFailure.QuoteUnavailable(it) }
+    nativeFailure("SIGNING_INTERRUPTED")?.let { return BeamFailure.SigningInterrupted(it) }
+    nativeFailure("OPERATION_CONFLICT")?.let { return BeamFailure.OperationConflict(it) }
+    nativeFailure("UNSUPPORTED")?.let { return BeamFailure.Unsupported(it) }
     nativeFailure("VALIDATION")?.let { return BeamFailure.Validation(it) }
     nativeFailure("INSUFFICIENT_FUNDS")?.let { return BeamFailure.InsufficientFunds(it) }
     nativeFailure("STORAGE")?.let { return BeamFailure.Storage(it, this) }
@@ -457,6 +508,10 @@ internal object BeamNative {
     external fun snapshot(handle: Long): String
     external fun receiveAddress(handle: Long, type: Int): String
     external fun transactions(handle: Long, offset: Int, limit: Int): String
+    external fun quoteSend(handle: Long, receiver: String, amount: Long, maximum: Boolean, comment: String, contextId: String): String
+    external fun signOffline(handle: Long, operationId: String, receiver: String, amount: Long, maximum: Boolean,
+        comment: String, contextId: String, quoteVersion: String): String
+    external fun exportSignedTransaction(handle: Long, operationId: String): ByteArray
     external fun previewSend(handle: Long, receiver: String, amount: Long, comment: String): String
     external fun prepareSend(
         handle: Long,
@@ -468,6 +523,8 @@ internal object BeamNative {
     ): String
     external fun commitSend(handle: Long, operationId: String): String
     external fun resolveSend(handle: Long, operationId: String): String
+    external fun sendOperations(handle: Long): String
+    external fun recoverSendOperations(handle: Long): String
     external fun abortPrepared(handle: Long, operationId: String): Boolean
     external fun seedPreparedSendForTests(handle: Long, operationId: String): String
     external fun seedInterruptedBootstrapForTests(handle: Long)
@@ -500,6 +557,7 @@ private data class SnapshotRestoreIntentDto(
 @Serializable
 private data class SnapshotDto(
     val phase: String,
+    val offlineSigning: OfflineSigningDto = OfflineSigningDto(),
     val currentHeight: Long = 0,
     val targetHeight: Long = 0,
     val balance: BalanceDto = BalanceDto(),
@@ -516,6 +574,7 @@ private data class SnapshotDto(
 ) {
     fun toDomain(): BackendSnapshot = BackendSnapshot(
         phase = BackendPhase.valueOf(phase),
+        offlineSigningState = offlineSigning.toDomain(),
         currentHeight = currentHeight,
         targetHeight = targetHeight,
         balance = balance.toDomain(phase == BackendPhase.Ready.name),
@@ -614,7 +673,36 @@ private data class ResolutionDto(
 )
 
 private fun String.toResolution(): BeamSendResolution {
-    val dto = json.decodeFromString<ResolutionDto>(this)
+    return json.decodeFromString<ResolutionDto>(this).toDomain()
+}
+
+@Serializable
+private data class SendOperationDto(
+    val operationId: String,
+    val transactionId: String,
+    val requestHash: String,
+    val amount: Long,
+    val fee: Long,
+    val resolution: ResolutionDto,
+    val deliveryMode: String = "Online",
+    val offlineState: String? = null,
+    val contextId: String = "",
+    val rules: String = "",
+    val serializedHash: String = "",
+    val mainKernelId: String = "",
+    val observedProofHeight: Long = 0,
+)
+
+private fun String.toSendOperations(): List<BeamSendOperation> =
+    json.decodeFromString<List<SendOperationDto>>(this).map {
+        BeamSendOperation(it.operationId, it.transactionId, it.requestHash, it.amount, it.fee, it.resolution.toDomain(),
+            BeamSendDeliveryMode.valueOf(it.deliveryMode), it.offlineState?.let(BeamOfflineSendState::valueOf),
+            it.contextId.takeIf(String::isNotEmpty), it.rules.takeIf(String::isNotEmpty),
+            it.serializedHash.takeIf(String::isNotEmpty), it.mainKernelId.takeIf(String::isNotEmpty), it.observedProofHeight)
+    }
+
+private fun ResolutionDto.toDomain(): BeamSendResolution {
+    val dto = this
     return when (dto.kind) {
         "NotPrepared" -> BeamSendResolution.NotPrepared
         "Prepared" -> BeamSendResolution.Prepared(requireNotNull(dto.transactionId))
@@ -627,4 +715,35 @@ private fun String.toResolution(): BeamSendResolution {
         )
         else -> throw BeamFailure.Native("Unknown send resolution: ${dto.kind}")
     }
+}
+
+@Serializable
+private data class OfflineSigningDto(
+    val phase: String = "Unavailable",
+    val contextId: String = "",
+    val height: Long = 0,
+    val shieldedCount: Long = 0,
+) {
+    fun toDomain(): BeamOfflineSigningState = when (phase) {
+        "Preparing" -> BeamOfflineSigningState.Preparing
+        "Ready" -> {
+            require(contextId.isNotBlank() && height > 0 && shieldedCount >= 0)
+            BeamOfflineSigningState.Ready(contextId, height, shieldedCount)
+        }
+        "Invalidated" -> BeamOfflineSigningState.Invalidated
+        else -> BeamOfflineSigningState.Unavailable
+    }
+}
+
+@Serializable
+private data class OfflineSignDto(val transactionId: String, val state: String)
+
+@Serializable
+private data class QuoteDto(
+    val amount: Long, val fee: Long, val total: Long, val explicitFee: Long,
+    val change: Long, val remainder: Long, val ordinaryInputs: Int, val shieldedInputs: Int,
+    val receiverType: String, val version: String, val contextId: String, val rules: String,
+) {
+    fun toDomain(): BeamSendQuote = BeamSendQuote(amount, fee, total, explicitFee, change, remainder,
+        ordinaryInputs, shieldedInputs, BeamAddressType.valueOf(receiverType), version, contextId, rules)
 }

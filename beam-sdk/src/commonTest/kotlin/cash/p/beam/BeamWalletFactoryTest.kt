@@ -22,6 +22,28 @@ import kotlin.test.assertTrue
 
 class BeamWalletFactoryTest {
     @Test
+    fun offlineSigningState_describesSavedContextAcrossStopAndInvalidation() = runTest {
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+        assertEquals(BeamOfflineSigningState.Unavailable, session.offlineSigningState.value)
+        val ready = BeamOfflineSigningState.Ready("7:context", 500, 200000)
+        backend.emitContext(ready)
+        session.offlineSigningState.first { it == ready }
+        assertIs<BeamWalletState.Stopped>(session.state.value)
+        session.start()
+        backend.emitContext(ready)
+        session.offlineSigningState.first { it == ready }
+        session.stop()
+        assertEquals(ready, session.offlineSigningState.value)
+        backend.emitContext(BeamOfflineSigningState.Invalidated)
+        session.offlineSigningState.first { it == BeamOfflineSigningState.Invalidated }
+        backend.emitContext(BeamOfflineSigningState.Preparing)
+        session.offlineSigningState.first { it == BeamOfflineSigningState.Preparing }
+        session.close()
+        assertEquals(BeamOfflineSigningState.Unavailable, session.offlineSigningState.value)
+    }
+
+    @Test
     fun createNew_invalidSeed_rejectsBeforeNativeCall() = runTest {
         val backend = FakeBackend()
 
@@ -192,6 +214,8 @@ class BeamWalletFactoryTest {
 
         assertFailsWith<IllegalStateException> { session.resolveSend(OPERATION_ID) }
         assertFailsWith<IllegalStateException> { session.abortPrepared(OPERATION_ID) }
+        assertFailsWith<IllegalStateException> { session.sendOperations() }
+        assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
         withContext(Dispatchers.Default.limitedParallelism(1)) {
             withTimeout(5_000) { session.stop() }
         }
@@ -228,6 +252,8 @@ class BeamWalletFactoryTest {
             )
         }
         assertFailsWith<IllegalStateException> { session.commitSend(OPERATION_ID) }
+        assertFailsWith<IllegalStateException> { session.sendOperations() }
+        assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
 
         assertEquals(0, backend.receiveAddressCalls)
         assertEquals(0, backend.previewCalls)
@@ -291,6 +317,32 @@ class BeamWalletFactoryTest {
     }
 
     @Test
+    fun offlineSigningDoesNotStartOrCommitAndExportIsExplicit() = runTest {
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+        val request = BeamQuoteRequest("token", BeamSendAmount.Max, BeamSendContext.Offline("context"))
+        val quote = session.quoteSend(request)
+        assertEquals(BeamOfflineSendState.Signed, session.signOffline(OPERATION_ID, request, quote.version).state)
+        assertEquals(0, backend.startCalls)
+        assertEquals(0, backend.prepareCalls)
+        assertEquals(0, backend.commitCalls)
+        assertEquals(0, backend.exportCalls)
+        assertTrue(session.exportSignedTransaction(OPERATION_ID).contentEquals(byteArrayOf(1, 2, 3)))
+    }
+
+    @Test
+    fun offlineSigningRejectsRunningOwnerAndBoundsBeforeBackend() = runTest {
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+        val request = BeamQuoteRequest("token", BeamSendAmount.Exact(1), BeamSendContext.Offline("context"))
+        assertFailsWith<IllegalArgumentException> { session.quoteSend(request.copy(receiverToken = "x".repeat(65_537))) }
+        assertEquals(0, backend.quoteCalls)
+        session.start()
+        assertFailsWith<BeamFailure.SendBusy> { session.signOffline(OPERATION_ID, request, "a".repeat(64)) }
+        assertEquals(0, backend.signCalls)
+    }
+
+    @Test
     fun transactionPage_fullPage_exposesNextOffset() = runTest {
         val backend = FakeBackend(transactionCount = 3)
         val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
@@ -304,6 +356,51 @@ class BeamWalletFactoryTest {
         assertEquals(null, second.nextOffset)
     }
 
+    @Test
+    fun sendInventory_isLocalAndRecoveryRequiresReady() = runTest {
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+        assertTrue(session.sendOperations().isEmpty())
+        assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
+        assertEquals(0, backend.recoveryCalls)
+        assertEquals(0, backend.startCalls)
+
+        session.start()
+        session.state.first { it is BeamWalletState.Ready }
+        session.prepareSend(OPERATION_ID, BeamSendRequest("token", 100), 1)
+        val prepared = session.sendOperations().single()
+        assertEquals(OPERATION_ID, prepared.operationId)
+        assertEquals(BeamSendResolution.Prepared("tx-1"), prepared.resolution)
+        assertEquals(BeamSendResolution.Submitted("tx-1"), session.recoverSendOperations().single().resolution)
+        assertEquals(1, backend.recoveryCalls)
+        session.stop()
+        assertEquals(prepared.transactionId, session.sendOperations().single().transactionId)
+        assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
+        session.close()
+        assertFailsWith<IllegalStateException> { session.sendOperations() }
+        assertFailsWith<IllegalStateException> { session.recoverSendOperations() }
+    }
+
+    @Test
+    fun acceptedPrepare_cancelledResponseRemainsDiscoverableInOriginatingSession() = runTest {
+        val accepted = CompletableDeferred<Unit>()
+        val backend = FakeBackend(prepareAccepted = accepted, losePrepareResponse = true)
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+        val other = factory(FakeBackend()).createNew(config().copy(storagePath = "other"), ByteArray(64), ByteArray(32))
+        session.start()
+        session.state.first { it is BeamWalletState.Ready }
+        val preparing = launch { session.prepareSend(OPERATION_ID, BeamSendRequest("token", 100), 1) }
+        accepted.await()
+        preparing.cancel()
+        preparing.join()
+        assertEquals(OPERATION_ID, session.sendOperations().single().operationId)
+        assertTrue(other.sendOperations().isEmpty())
+        assertEquals(BeamSendResolution.Submitted("tx-1"), session.recoverSendOperations().single().resolution)
+        assertEquals(1, backend.prepareCalls)
+        session.close()
+        other.close()
+    }
+
     private fun factory(backend: FakeBackend) = BeamWalletFactory { backend }
 
     private fun config() = BeamSdkConfig(BeamNetwork.Mainnet, storagePath = "wallet")
@@ -315,6 +412,8 @@ class BeamWalletFactoryTest {
 
 private class FakeBackend(
     transactionCount: Int = 0,
+    private val prepareAccepted: CompletableDeferred<Unit>? = null,
+    private val losePrepareResponse: Boolean = false,
     private val closeStarted: CompletableDeferred<Unit>? = null,
     private val allowClose: CompletableDeferred<Unit>? = null,
     private val stopStarted: CompletableDeferred<Unit>? = null,
@@ -328,6 +427,9 @@ private class FakeBackend(
     private val transactionItems = List(transactionCount) { index -> transaction("tx-$index") }
 
     override val snapshot: StateFlow<BackendSnapshot> = mutableSnapshot
+    fun emitContext(value: BeamOfflineSigningState) {
+        mutableSnapshot.value = mutableSnapshot.value.copy(offlineSigningState = value)
+    }
     var createCalls = 0
     var startCalls = 0
     var stopCalls = 0
@@ -338,6 +440,8 @@ private class FakeBackend(
     var prepareCalls = 0
     var resolveCalls = 0
     var abortCalls = 0
+    var recoveryCalls = 0
+    private var operations = emptyList<BeamSendOperation>()
     var seedReference: ByteArray? = null
     var keyReference: ByteArray? = null
     var createdRestoreSource: RestoreSource? = null
@@ -395,6 +499,23 @@ private class FakeBackend(
     override suspend fun transactions(offset: Int, limit: Int): List<BeamTransaction> =
         transactionItems.drop(offset).take(limit)
 
+    var quoteCalls = 0
+    var signCalls = 0
+    var exportCalls = 0
+    override suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote {
+        quoteCalls++
+        return BeamSendQuote(100, 10, 110, 10, 0, 0, 1, 0, BeamAddressType.PublicOffline,
+            "a".repeat(64), (request.context as? BeamSendContext.Offline)?.contextId.orEmpty(), "rules")
+    }
+    override suspend fun signOffline(operationId: String, request: BeamQuoteRequest, quoteVersion: String): BeamOfflineSignResult {
+        signCalls++
+        return BeamOfflineSignResult("tx-offline", BeamOfflineSendState.Signed)
+    }
+    override suspend fun exportSignedTransaction(operationId: String): ByteArray {
+        exportCalls++
+        return byteArrayOf(1, 2, 3)
+    }
+
     override suspend fun previewSend(request: BeamSendRequest): BeamSendPreview {
         previewCalls++
         return BeamSendPreview("hash", 1, request.amount, 10, request.amount + 10, BeamAddressType.Offline)
@@ -407,6 +528,10 @@ private class FakeBackend(
     ): PreparedBeamSend {
         prepareCalls++
         preparedOperationId = operationId
+        operations = listOf(BeamSendOperation(operationId, "tx-1", "hash", request.amount, 10,
+            BeamSendResolution.Prepared("tx-1")))
+        prepareAccepted?.complete(Unit)
+        if (losePrepareResponse) CompletableDeferred<Unit>().await()
         return PreparedBeamSend(operationId, "tx-1")
     }
 
@@ -418,6 +543,13 @@ private class FakeBackend(
     override suspend fun resolveSend(operationId: String): BeamSendResolution {
         resolveCalls++
         return BeamSendResolution.Prepared("tx-1")
+    }
+
+    override suspend fun sendOperations(): List<BeamSendOperation> = operations
+    override suspend fun recoverSendOperations(): List<BeamSendOperation> {
+        recoveryCalls++
+        operations = operations.map { it.copy(resolution = BeamSendResolution.Submitted(it.transactionId)) }
+        return operations
     }
 
     override suspend fun abortPrepared(operationId: String): Boolean {

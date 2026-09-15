@@ -1,5 +1,9 @@
 package cash.p.beam.internal
 
+import cash.p.beam.BeamQuoteRequest
+import cash.p.beam.BeamSendQuote
+import cash.p.beam.BeamOfflineSignResult
+import cash.p.beam.BeamOfflineSigningState
 import cash.p.beam.BeamAddress
 import cash.p.beam.BeamAddressType
 import cash.p.beam.BeamBalance
@@ -7,6 +11,7 @@ import cash.p.beam.BeamSdkConfig
 import cash.p.beam.BeamSendPreview
 import cash.p.beam.BeamSendRequest
 import cash.p.beam.BeamSendResolution
+import cash.p.beam.BeamSendOperation
 import cash.p.beam.BeamTransaction
 import cash.p.beam.PreparedBeamSend
 import cash.p.beam.RestoreSource
@@ -27,6 +32,9 @@ internal interface BeamBackend {
     suspend fun close()
     suspend fun receiveAddress(type: BeamAddressType): BeamAddress
     suspend fun transactions(offset: Int, limit: Int): List<BeamTransaction>
+    suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote
+    suspend fun signOffline(operationId: String, request: BeamQuoteRequest, quoteVersion: String): BeamOfflineSignResult
+    suspend fun exportSignedTransaction(operationId: String): ByteArray
     suspend fun previewSend(request: BeamSendRequest): BeamSendPreview
     suspend fun prepareSend(
         operationId: String,
@@ -35,11 +43,14 @@ internal interface BeamBackend {
     ): PreparedBeamSend
     suspend fun commitSend(operationId: String): BeamSendResolution
     suspend fun resolveSend(operationId: String): BeamSendResolution
+    suspend fun sendOperations(): List<BeamSendOperation>
+    suspend fun recoverSendOperations(): List<BeamSendOperation>
     suspend fun abortPrepared(operationId: String): Boolean
 }
 
 internal data class BackendSnapshot(
     val phase: BackendPhase = BackendPhase.Stopped,
+    val offlineSigningState: BeamOfflineSigningState = BeamOfflineSigningState.Unavailable,
     val currentHeight: Long = 0,
     val targetHeight: Long = 0,
     val balance: BeamBalance = BeamBalance(),

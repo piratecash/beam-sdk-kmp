@@ -44,6 +44,7 @@ public:
     }
 
     ~SendAdmissionFixture() {
+        session_.stop();
         wallet_.reset();
         session_.database_.reset();
         std::error_code ignored;
@@ -52,6 +53,8 @@ public:
 
     SendRecord prepare(const std::string& operation) {
         const auto preview = session_.previewMaterial(receiver_, 100'000, "admission fixture");
+        checkAdmissionTest(preview == session_.previewMaterial(receiver_, 100'000, "admission fixture"),
+            "Repeated unchanged preview was not stable");
         const auto result = Json::parse(session_.prepareSendOnWalletThread(
             operation, receiver_, 100'000, "admission fixture", preview.first));
         auto saved = record(operation);
@@ -98,6 +101,68 @@ public:
         return session_.resolveSendOnWalletThread(saved);
     }
 
+    Json inventory() { return Json::parse(session_.sendOperations()); }
+    Json recover() { return Json::parse(session_.recoverSendOperationsOnWalletThread(wallet_)); }
+
+    std::shared_ptr<beam::wallet::WalletDB> database() {
+        return std::dynamic_pointer_cast<beam::wallet::WalletDB>(session_.database_);
+    }
+
+    void raw(const std::string& key, const std::string& value) {
+        setRawString(*session_.database_, key.c_str(), value);
+        flushDatabase(session_.database_);
+    }
+
+    template <typename F>
+    auto queuedCall(F&& call, bool loseResponse = false) {
+        if (!session_.client_) {
+            session_.client_ = std::make_shared<BridgeWalletClient>(
+                session_, session_.rules_, session_.database_, "", session_.reactor_);
+            session_.client_->walletForTests = wallet_;
+            session_.snapshot_.phase = Phase::Ready;
+        }
+        session_.dropInvokeResponseForTests_ = loseResponse;
+        session_.invokeTimeoutForTests_ = std::chrono::milliseconds(loseResponse ? 250 : 5'000);
+        std::promise<void> queued;
+        auto accepted = queued.get_future();
+        session_.invokeQueuedForTests_ = [&] { queued.set_value(); };
+        auto result = std::async(std::launch::async, std::forward<F>(call));
+        checkAdmissionTest(accepted.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "Native operation was not accepted by the owner queue");
+        session_.client_->getAsync()->makeIWTCall([]() -> boost::any { return true; },
+            [&](const boost::any&) { session_.reactor_->stop(); });
+        session_.reactor_->run();
+        result.wait();
+        session_.invokeQueuedForTests_ = {};
+        session_.dropInvokeResponseForTests_ = false;
+        return result;
+    }
+
+    template <typename F>
+    static void expectFailure(F&& call) {
+        try { call(); } catch (const std::exception&) { return; }
+        throw std::runtime_error("Expected deterministic send fault");
+    }
+
+    template <typename T>
+    static void expectTimeout(std::future<T>& result) {
+        bool timedOut = false;
+        try { result.get(); } catch (const std::runtime_error& error) {
+            timedOut = std::string(error.what()) == "Timed out waiting for Beam owner thread";
+        }
+        checkAdmissionTest(timedOut, "Lost accepted response did not reach the real owner-thread timeout");
+    }
+
+    void failBoundary(const std::string& boundary, bool commitFailure) {
+        session_.sendBoundaryForTests_ = [&, boundary, commitFailure](const char* current) {
+            if (boundary != current) return;
+            if (commitFailure) database()->FailNextFlushForTests();
+            else throw std::runtime_error("Synthetic lost response after send boundary");
+        };
+    }
+
+    void clearFault() { session_.sendBoundaryForTests_ = {}; }
+
     SendRecord record(const std::string& operation) const {
         SendRecord saved;
         checkAdmissionTest(loadSendRecord(*session_.database_, operation, saved), "Missing send journal");
@@ -117,7 +182,8 @@ public:
     }
 
     void marker(const std::string& operation) {
-        setRawString(*session_.database_, kActiveSendVar, operation);
+        if (operation.empty()) session_.database_->removeVarRaw(kActiveSendVar);
+        else setRawString(*session_.database_, kActiveSendVar, operation);
         flushDatabase(session_.database_);
     }
 
@@ -184,10 +250,20 @@ public:
     }
 
     static void run() {
+        runInventoryRecovery();
         {
             SendAdmissionFixture f;
             const auto a = f.prepare("A");
             const auto raw = f.journal("A");
+            checkAdmissionTest(f.prepare("A").txId == a.txId, "Idempotent prepare changed its recorded identity");
+            bool changedRequestRejected = false;
+            try {
+                f.session_.prepareSendOnWalletThread("A", f.receiver_, 100'001, "admission fixture", a.previewVersion);
+            } catch (const std::logic_error& error) {
+                changedRequestRejected = std::string(error.what()) == "operationId is already bound to another send request";
+            }
+            checkAdmissionTest(changedRequestRejected && f.journal("A") == raw && f.starts() == 0,
+                "Changed request reused or mutated an existing operation identity");
             const auto active = f.marker();
             f.session_.client_ = std::make_shared<BridgeWalletClient>(
                 f.session_, f.session_.rules_, f.session_.database_, "", f.session_.reactor_);
@@ -333,6 +409,310 @@ public:
         }
     }
 
+    static void runInventoryRecovery() {
+        // Real v1 bytes outside the active marker are the inventory, including inactive rows.
+        {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            const auto raw = f.journal("A");
+            f.marker("");
+            const auto listed = f.inventory();
+            checkAdmissionTest(listed.size() == 1 && listed[0]["transactionId"] == a.txId &&
+                listed[0]["resolution"]["kind"] == "Prepared" && listed[0].count("receiver") == 0 &&
+                listed[0].count("comment") == 0, "Inactive legacy send was hidden or exposed request material");
+            checkAdmissionTest(f.journal("A") == raw && f.marker().empty() && f.starts() == 0,
+                "Local stopped inventory mutated or broadcast a send");
+            f.reopen();
+            expectDeferred([&] { f.prepare("B"); });
+            checkAdmissionTest(f.recover()[0]["transactionId"] == a.txId && f.starts() == 1,
+                "Recovery did not retain inactive legacy identity");
+            f.recover();
+            f.reopen();
+            f.recover();
+            checkAdmissionTest(f.starts() == 1 && f.rowCount() == 1, "Repeated recovery duplicated Core StartTransaction");
+        }
+        {
+            SendAdmissionFixture first;
+            const auto a = first.prepare("same-confirmation");
+            SendAdmissionFixture second;
+            checkAdmissionTest(second.inventory().empty(), "Independent wallet inherited another inventory");
+            const auto b = second.prepare("same-confirmation");
+            second.recover();
+            checkAdmissionTest(a.txId != b.txId && first.starts() == 0 && second.starts() == 1,
+                "Independent wallet admission or transaction identity was shared");
+        }
+        for (const auto state : {SendState::Prepared, SendState::Committing, SendState::Submitted}) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            f.setState("A", state);
+            f.marker("");
+            auto other = a;
+            other.operationId = "B";
+            other.txId = txIdString(beam::wallet::GenerateTxID());
+            saveSendRecord(*f.session_.database_, other);
+            flushDatabase(f.session_.database_);
+            const auto before = f.inventory();
+            expectDeferred([&] { f.recover(); });
+            checkAdmissionTest(f.inventory() == before && f.starts() == 0 && f.rowCount() == 0,
+                "Conflicting legacy records were partially recovered");
+        }
+        for (const auto state : {SendState::Prepared, SendState::Committing}) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            f.setState("A", state);
+            f.reopen();
+            f.recover();
+            checkAdmissionTest(f.starts() == 1 && f.hasRow(a), "Missing-row retry did not use the recorded TxID");
+        }
+        {
+            SendAdmissionFixture f;
+            f.prepare("A");
+            f.setState("A", SendState::Submitted);
+            checkAdmissionTest(f.recover()[0]["resolution"]["kind"] == "Indeterminate" && f.starts() == 0,
+                "Submitted without Core evidence was replayed");
+            expectDeferred([&] { f.prepare("B"); });
+        }
+        // The invalid last record must be discovered before reconciling valid earlier records.
+        for (int corruption = 0; corruption != 6; ++corruption) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            const auto before = f.journal("A");
+            auto bad = Json::parse(before);
+            bad["operationId"] = "Z";
+            bad["txId"] = txIdString(beam::wallet::GenerateTxID());
+            if (corruption == 1) bad["state"] = "future-state";
+            if (corruption == 2) bad["operationId"] = "wrong-key";
+            if (corruption == 3) bad["txId"] = "broken";
+            if (corruption == 4) bad["amount"] = 123;
+            const auto key = corruption == 5 ? "beam.sdk.kmp.send.v2.Z" : sendRecordKey("Z");
+            const auto bytes = corruption == 0 ? "{ private-receiver-secret" : bad.dump();
+            f.raw(key, bytes);
+            for (auto action : {0, 1, 2}) {
+                bool sanitized = false;
+                try {
+                    if (action == 0) f.inventory();
+                    if (action == 1) f.recover();
+                    if (action == 2) f.prepare("B");
+                } catch (const std::runtime_error& error) {
+                    sanitized = std::string(error.what()) == "Durable Beam send inventory is invalid or unsupported";
+                }
+                checkAdmissionTest(sanitized, "Invalid record did not fail with a sanitized inventory error");
+            }
+            checkAdmissionTest(f.journal("A") == before && f.starts() == 0 && !f.hasRow(a),
+                "Malformed later record allowed partial recovery");
+            std::string retained;
+            checkAdmissionTest(getRawString(*f.session_.database_, key.c_str(), retained) && retained == bytes,
+                "Invalid record was modified or deleted");
+        }
+        for (int mismatch = 0; mismatch != 3; ++mismatch) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            TxDescription tx(parseTxId(a.txId), TxType::PushTransaction);
+            tx.m_sender = mismatch != 0;
+            tx.m_amount = a.amount + (mismatch == 1 ? 1 : 0);
+            tx.m_fee = a.fee + (mismatch == 2 ? 1 : 0);
+            tx.m_assetId = Asset::s_BeamID;
+            f.session_.database_->saveTx(tx);
+            flushDatabase(f.session_.database_);
+            expectFailure([&] { f.inventory(); });
+            expectFailure([&] { f.recover(); });
+            checkAdmissionTest(f.starts() == 0, "Mismatched Core evidence was recreated");
+        }
+        {
+            SendAdmissionFixture f;
+            const auto a = f.completedA();
+            const auto b = f.prepare("B");
+            checkAdmissionTest(f.inventory()[0]["resolution"]["kind"] == "Terminal", "Terminal record was not retained");
+            f.rollback("A");
+            checkAdmissionTest(f.inventory()[0]["resolution"]["kind"] == "Submitted", "Inventory cached terminal over reorg evidence");
+            expectDeferred([&] { f.recover(); });
+            checkAdmissionTest(f.starts() == 1 && f.hasRow(a) && !f.hasRow(b), "Reorg recovery started a competing send");
+        }
+        // Actual SQLite failures at the two prepare writes must not survive same-session reads or reopen.
+        for (const auto key : {sendRecordKey("A"), std::string(kActiveSendVar)}) {
+            SendAdmissionFixture f;
+            f.database()->FailVariableWritesForTests(key);
+            expectFailure([&] { f.prepare("A"); });
+            checkAdmissionTest(f.inventory().empty() && f.marker().empty(), "Failed prepare left same-session journal evidence");
+            f.database()->FailVariableWritesForTests("");
+            f.reopen();
+            checkAdmissionTest(f.inventory().empty() && f.starts() == 0, "Failed prepare became durable on reopen");
+        }
+        for (const auto boundary : {"prepare-record", "prepare-marker"}) {
+            SendAdmissionFixture f;
+            f.failBoundary(boundary, true);
+            expectFailure([&] { f.prepare("A"); });
+            f.clearFault();
+            checkAdmissionTest(f.inventory().empty() && f.marker().empty(), "Prepare COMMIT failure leaked same-session state");
+            f.reopen();
+            checkAdmissionTest(f.inventory().empty(), "Prepare COMMIT failure survived reopen");
+        }
+        for (const auto boundary : {"committing-record", "core-start", "submitted-record"}) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            f.failBoundary(boundary, true);
+            expectFailure([&] { f.commit("A"); });
+            f.clearFault();
+            const auto before = f.inventory();
+            const bool coreDurable = std::string(boundary) == "submitted-record";
+            checkAdmissionTest(f.hasRow(a) == coreDurable, "Failed durability fence exposed the wrong Core state");
+            f.reopen();
+            checkAdmissionTest(f.inventory() == before, "Same-session failed-fence state differed from reopened state");
+            const auto starts = f.starts();
+            f.recover();
+            checkAdmissionTest(f.hasRow(a) && f.starts() == starts + (coreDurable ? 0 : 1),
+                "Fence retry lost identity or recreated a durable Core transaction");
+            f.recover();
+            checkAdmissionTest(f.rowCount() == 1, "Fence retry duplicated the payment");
+        }
+        for (const auto boundary : {"prepared", "committing", "core-created", "submitted"}) {
+            SendAdmissionFixture f;
+            if (std::string(boundary) != "prepared") f.prepare("A");
+            f.failBoundary(boundary, false);
+            expectFailure([&] {
+                if (std::string(boundary) == "prepared") f.prepare("A");
+                else f.commit("A");
+            });
+            f.clearFault();
+            const auto a = f.record("A");
+            f.reopen();
+            checkAdmissionTest(f.inventory()[0]["transactionId"] == a.txId, "Lost response lost durable identity");
+            f.recover();
+            f.recover();
+            checkAdmissionTest(f.starts() == 1 && f.rowCount() == 1, "Lost-response retry duplicated StartTransaction");
+        }
+        for (bool coreCreated : {false, true}) {
+            SendAdmissionFixture f;
+            const auto a = f.prepare("A");
+            if (coreCreated) {
+                f.session_.sendBoundaryForTests_ = [&](const char* boundary) {
+                    if (std::string(boundary) == "core-created") f.database()->FailVariableWritesForTests(sendRecordKey("A"));
+                };
+            } else f.database()->FailVariableWritesForTests(sendRecordKey("A"));
+            expectFailure([&] { f.commit("A"); });
+            f.clearFault();
+            const auto before = f.inventory();
+            checkAdmissionTest(f.hasRow(a) == coreCreated, "Failed commit record write lost its Core fence");
+            f.database()->FailVariableWritesForTests("");
+            f.reopen();
+            checkAdmissionTest(f.inventory() == before, "Failed commit record write survived only in memory");
+            f.recover();
+            checkAdmissionTest(f.starts() == 1 && f.rowCount() == 1, "Failed commit record write caused duplicate creation");
+        }
+        for (const auto boundary : {"abort-record", "abort-marker"}) {
+            SendAdmissionFixture f;
+            f.prepare("A");
+            const auto before = f.inventory();
+            f.failBoundary(boundary, true);
+            expectFailure([&] { f.session_.abortPrepared("A"); });
+            f.clearFault();
+            checkAdmissionTest(f.inventory() == before && f.marker() == "A", "Failed abort fence leaked partial removal");
+            f.reopen();
+            checkAdmissionTest(f.inventory() == before && f.marker() == "A", "Failed abort fence became durable");
+        }
+        for (const auto key : {sendRecordKey("A"), std::string(kActiveSendVar)}) {
+            SendAdmissionFixture f;
+            f.prepare("A");
+            const auto before = f.inventory();
+            f.database()->FailVariableWritesForTests(key);
+            expectFailure([&] { f.session_.abortPrepared("A"); });
+            checkAdmissionTest(f.inventory() == before && f.marker() == "A", "Failed abort partially deleted journal/marker");
+            f.database()->FailVariableWritesForTests("");
+            f.reopen();
+            checkAdmissionTest(f.inventory() == before && f.session_.abortPrepared("A") && f.inventory().empty(),
+                "Abort rollback or retry was not durable");
+        }
+        {
+            SendAdmissionFixture f;
+            f.prepare("A");
+            f.commit("A");
+            f.setState("A", SendState::Prepared);
+            checkAdmissionTest(!f.session_.abortPrepared("A") && f.inventory().size() == 1,
+                "Abort removed Prepared evidence for an already started Core transaction");
+        }
+        // Accepted public prepare and commit execute before their response is intentionally dropped.
+        {
+            SendAdmissionFixture f;
+            const auto preview = f.session_.previewMaterial(f.receiver_, 100'000, "queued fixture");
+            auto prepareResult = f.queuedCall([&] {
+                return f.session_.prepareSend("A", f.receiver_, 100'000, "queued fixture", preview.first);
+            }, true);
+            expectTimeout(prepareResult);
+            const auto listed = Json::parse(f.queuedCall([&] { return f.session_.sendOperations(); }).get());
+            checkAdmissionTest(listed.size() == 1 && listed[0]["resolution"]["kind"] == "Prepared" && f.starts() == 0,
+                "Accepted prepare with lost response was not discoverable");
+            const auto a = f.record("A");
+            auto commitResult = f.queuedCall([&] { return f.session_.commitSend("A"); }, true);
+            expectTimeout(commitResult);
+            const auto recovered = Json::parse(f.queuedCall([&] { return f.session_.recoverSendOperations(); }).get());
+            checkAdmissionTest(recovered[0]["transactionId"] == a.txId && f.starts() == 1 && f.hasRow(a),
+                "Accepted commit with lost response was duplicated by public retry");
+            f.session_.stop();
+            f.wallet_.reset();
+            f.session_.close();
+            expectFailure([&] { f.session_.sendOperations(); });
+            expectFailure([&] { f.session_.recoverSendOperations(); });
+            checkAdmissionTest(!f.session_.client_ && !f.session_.database_ && !f.session_.reactor_,
+                "Completed close retained native work ownership");
+        }
+        // Both FIFO orderings of accepted abort/recovery requests are safe on the owner queue.
+        for (bool abortFirst : {false, true}) {
+            SendAdmissionFixture f;
+            f.prepare("A");
+            f.queuedCall([&] { return f.session_.sendOperations(); }).get();
+            std::promise<void> firstQueued, secondQueued;
+            auto firstAccepted = firstQueued.get_future();
+            auto secondAccepted = secondQueued.get_future();
+            f.session_.invokeQueuedForTests_ = [&] { firstQueued.set_value(); };
+            auto abort = [&] { return f.session_.abortPrepared("A"); };
+            auto recovery = [&] { f.session_.recoverSendOperations(); return false; };
+            auto first = std::async(std::launch::async, [&] { return abortFirst ? abort() : recovery(); });
+            firstAccepted.wait();
+            f.session_.invokeQueuedForTests_ = [&] { secondQueued.set_value(); };
+            auto second = std::async(std::launch::async, [&] { return abortFirst ? recovery() : abort(); });
+            secondAccepted.wait();
+            f.session_.client_->getAsync()->makeIWTCall([]() -> boost::any { return true; },
+                [&](const boost::any&) { f.session_.reactor_->stop(); });
+            f.session_.reactor_->run();
+            const auto firstResult = first.get();
+            const auto secondResult = second.get();
+            f.session_.invokeQueuedForTests_ = {};
+            f.session_.stop();
+            checkAdmissionTest(abortFirst ? firstResult && f.starts() == 0 && f.inventory().empty() :
+                !secondResult && f.starts() == 1 && f.inventory().size() == 1,
+                "Abort/recovery race lost started transaction evidence or broadcast an aborted operation");
+        }
+        {
+            SendAdmissionFixture f;
+            f.completedA();
+            f.queuedCall([&] { return f.session_.sendOperations(); }).get();
+            std::promise<void> firstQueued, secondQueued;
+            auto firstAccepted = firstQueued.get_future();
+            auto secondAccepted = secondQueued.get_future();
+            f.session_.invokeQueuedForTests_ = [&] { firstQueued.set_value(); };
+            auto first = std::async(std::launch::async, [&] { return f.session_.sendOperations(); });
+            firstAccepted.wait();
+            f.session_.client_->getAsync()->makeIWTCall([&]() -> boost::any {
+                f.rollback("A");
+                return true;
+            }, [](const boost::any&) {});
+            f.session_.invokeQueuedForTests_ = [&] { secondQueued.set_value(); };
+            auto second = std::async(std::launch::async, [&] { return f.session_.sendOperations(); });
+            secondAccepted.wait();
+            f.session_.client_->getAsync()->makeIWTCall([]() -> boost::any { return true; },
+                [&](const boost::any&) { f.session_.reactor_->stop(); });
+            f.session_.reactor_->run();
+            const auto before = Json::parse(first.get());
+            const auto after = Json::parse(second.get());
+            f.session_.invokeQueuedForTests_ = {};
+            checkAdmissionTest(before[0]["resolution"]["kind"] == "Terminal" &&
+                after[0]["resolution"]["kind"] == "Submitted" &&
+                before[0]["transactionId"] == after[0]["transactionId"] && f.starts() == 1,
+                "Inventory requests concurrent with Core rollback did not preserve serial current evidence");
+        }
+        std::cout << "SEND_OPERATION_INVENTORY_RECOVERY_OK\n";
+    }
+
     static void throwFromAdmission(bool commit) {
         SendAdmissionFixture f;
         f.completedA();
@@ -341,6 +721,13 @@ public:
         if (commit) f.commit("B");
         else f.prepare("B");
         throw std::runtime_error("Admission unexpectedly succeeded");
+    }
+
+    static void throwFromMalformedInventory() {
+        SendAdmissionFixture f;
+        f.prepare("A");
+        f.raw(sendRecordKey("Z"), "{ private-receiver-secret");
+        f.recover();
     }
 
 private:
@@ -377,5 +764,10 @@ int main() {
 extern "C" JNIEXPORT void JNICALL
 Java_cash_p_beam_internal_SendAdmissionNativeTest_deferFromNative(JNIEnv* env, jobject, jboolean commit) {
     jniCall(env, [&] { SendAdmissionFixture::throwFromAdmission(commit == JNI_TRUE); return true; }, false);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_cash_p_beam_internal_SendAdmissionNativeTest_malformedInventoryFromNative(JNIEnv* env, jobject) {
+    jniCall(env, [&] { SendAdmissionFixture::throwFromMalformedInventory(); return true; }, false);
 }
 #endif

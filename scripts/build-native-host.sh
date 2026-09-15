@@ -54,28 +54,48 @@ build_target() {
     fi
 }
 
-build_target beam_sdk_kmp
-if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
-    build_target beam_sdk_kmp_native_tests
+test_binary_path() {
+    local target="$1"
     if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
-        test_binary="$build_dir/Release/beam_sdk_kmp_native_tests.exe"
+        printf '%s\n' "$build_dir/Release/$target.exe"
     else
-        test_binary="$(find "$build_dir" -type f -name beam_sdk_kmp_native_tests -print -quit)"
+        printf '%s\n' "$build_dir/$target"
     fi
-    if [[ -z "$test_binary" || ! -f "$test_binary" ]]; then
-        echo "Native regression-test binary was not produced" >&2
+}
+
+run_test_target() {
+    local target="$1"
+    local test_binary
+    build_target "$target"
+    test_binary="$(test_binary_path "$target")"
+    if [[ ! -f "$test_binary" ]]; then
+        echo "Native regression-test binary was not produced: $target" >&2
         exit 1
     fi
     "$test_binary"
+}
+
+build_target beam_sdk_kmp
+if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
+    run_test_target beam_sdk_kmp_native_tests
     for fixture in send_admission snapshot_reorg; do
-        build_target "beam_sdk_kmp_${fixture}_tests"
+        run_test_target "beam_sdk_kmp_${fixture}_tests"
         build_target "beam_sdk_kmp_${fixture}_fixture"
-        if [[ "$triple" == "x86_64-pc-windows-msvc" ]]; then
-            "$build_dir/Release/beam_sdk_kmp_${fixture}_tests.exe"
-        else
-            "$build_dir/beam_sdk_kmp_${fixture}_tests"
-        fi
     done
+    build_target beam_sdk_kmp_offline_history_fixture
+    for test in offline_context offline_signing stateless_codec offline_signer transaction_relay; do
+        run_test_target "beam_sdk_kmp_${test}_tests"
+    done
+    offline_signer_binary="$(test_binary_path beam_sdk_kmp_offline_signer_tests)"
+    case "${BEAM_NATIVE_PRODUCTION_PROOFS:-off}" in
+        off) ;;
+        small) "$offline_signer_binary" --production-small-proofs ;;
+        full) "$offline_signer_binary" --production-proofs ;;
+        *)
+            echo "BEAM_NATIVE_PRODUCTION_PROOFS must be off, small, or full" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 destination="$repo_root/beam-sdk/prebuilt/desktop/native/$triple"

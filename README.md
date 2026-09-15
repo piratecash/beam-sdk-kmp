@@ -19,6 +19,10 @@ recovery, lifecycle, and release contract is summarized below.
   for a fork deeper than retained history;
 - one-sided receive tokens, balance/history, fee preview and durable
   `prepare → commit → resolve` sending;
+- durable post-sync offline-signing context plus stopped-wallet `quoteSend`, `signOffline` and
+  `exportSignedTransaction` flows for native BEAM one-sided sends;
+- bounded stateless token parsing and signed-transaction inspection, plus isolated foreign
+  transaction relay without opening or changing a wallet;
 - serialized, idempotent `start/stop/close`, including cancellation during snapshot download/import
   and Android demo foreground/background handoff;
 - a shared Compose demo hosted by Android and desktop JVM.
@@ -66,6 +70,22 @@ transaction that creates the account, closing the process-death window before th
 node request. Durable send records can be resolved, and an unbroadcast `Prepared` record can be
 aborted, while the network client is stopped.
 
+After a normal synchronized session prepares a durable offline-signing context, its
+`BeamOfflineSigningState.Ready.contextId` can be used with `quoteSend` and `signOffline` while the
+wallet owner is stopped. Readiness describes the saved checkpoint and does not claim that it is the
+current live tip. `signOffline` persists signed material and reservations without broadcasting or
+returning bytes. `exportSignedTransaction` durably marks the operation `Exported` before returning
+canonical bytes; repeated exports are byte-identical. Once export may have returned, abort,
+rejection, elapsed time, stop or close cannot revoke those bytes or release their inputs.
+
+`BeamTokenParser` and `BeamTransactionInspector` work without wallet state or network access.
+Inspection accepts at most 1 MiB of canonical transaction bytes and also bounds vector counts,
+aggregate elements and parsing depth. Its hash, kernel IDs, height ranges and counts are useful
+display metadata, but context-free inspection does not prove amounts, receiver identity,
+confirmation, spendability or source network. `BeamTransactionRelay` sends exact validated bytes
+through an isolated client that creates no wallet, history or reservations. An `Accepted` relay
+result means a node accepted the submission; it is not confirmation or finality.
+
 ## Build native libraries
 
 Use JDK 21, CMake 3.24+ and the pinned inputs in `native/*.lock`.
@@ -89,8 +109,14 @@ BEAM_SNAPSHOT_REORG_FIXTURE="$PWD/.native-cache/build-host-tests/libbeam_sdk_kmp
 BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE=1 \
 BEAM_SEND_ADMISSION_FIXTURE="$PWD/.native-cache/build-host-tests/libbeam_sdk_kmp_send_admission_fixture.$([ "$(uname -s)" = Darwin ] && echo dylib || echo so)" \
 BEAM_EXPECT_SEND_ADMISSION_FIXTURE=1 \
+BEAM_OFFLINE_HISTORY_FIXTURE="$PWD/.native-cache/build-host-tests/libbeam_sdk_kmp_offline_history_fixture.$([ "$(uname -s)" = Darwin ] && echo dylib || echo so)" \
+BEAM_EXPECT_OFFLINE_HISTORY_FIXTURE=1 \
 BEAM_EXPECT_NATIVE_TEST_FIXTURES=1 \
   ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest
+
+# Optional and expensive: generate real production-sized offline signer proofs.
+BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-tests \
+  BEAM_NATIVE_TESTS=1 BEAM_NATIVE_PRODUCTION_PROOFS=small ./scripts/build-native-host.sh
 
 # Restage a production library without test-only JNI fixtures before publishing.
 BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-release ./scripts/build-native-host.sh
@@ -106,9 +132,18 @@ $env:BEAM_SNAPSHOT_REORG_FIXTURE = (Resolve-Path '.native-cache/build-host-tests
 $env:BEAM_EXPECT_SNAPSHOT_REORG_FIXTURE = '1'
 $env:BEAM_SEND_ADMISSION_FIXTURE = (Resolve-Path '.native-cache/build-host-tests/Release/beam_sdk_kmp_send_admission_fixture.dll').Path
 $env:BEAM_EXPECT_SEND_ADMISSION_FIXTURE = '1'
+$env:BEAM_OFFLINE_HISTORY_FIXTURE = (Resolve-Path '.native-cache/build-host-tests/Release/beam_sdk_kmp_offline_history_fixture.dll').Path
+$env:BEAM_EXPECT_OFFLINE_HISTORY_FIXTURE = '1'
 $env:BEAM_EXPECT_NATIVE_TEST_FIXTURES = '1'
 ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest
 ```
+
+`BEAM_NATIVE_TESTS=1` runs the deterministic wallet, admission, reorg, offline-context,
+offline-signing feasibility, stateless-codec, offline-signer and transaction-relay native tests on
+supported desktop hosts. Production-size signer proof generation is intentionally opt-in with
+`BEAM_NATIVE_PRODUCTION_PROOFS=small` (`--production-small-proofs`, historical 1,024-member proof)
+or `full` (`--production-proofs`, 65,536-member proof). A manually dispatched CI run exposes the
+same choice on the Linux desktop job only.
 
 The Android build uses NDK `27.0.12077973`, API 27, static C++ runtime and 16 KiB ELF page
 alignment. It stages `arm64-v8a` and `armeabi-v7a` libraries under

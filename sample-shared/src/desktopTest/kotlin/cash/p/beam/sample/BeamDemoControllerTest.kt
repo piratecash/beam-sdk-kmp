@@ -848,6 +848,7 @@ private class FakeDemoSession(
     val firstStopEntered = CompletableDeferred<Unit>()
     val allowFirstStop = CompletableDeferred<Unit>()
     override val state: StateFlow<BeamWalletState> = mutableState
+    override val offlineSigningState = MutableStateFlow<cash.p.beam.BeamOfflineSigningState>(cash.p.beam.BeamOfflineSigningState.Unavailable)
     override val balance: StateFlow<BeamBalance> = MutableStateFlow(BeamBalance())
     override val transactions: StateFlow<List<BeamTransaction>> = MutableStateFlow(emptyList())
     @Volatile
@@ -896,6 +897,13 @@ private class FakeDemoSession(
     override suspend fun transactionPage(offset: Int, limit: Int): BeamTransactionPage =
         BeamTransactionPage(emptyList(), null)
 
+    override suspend fun quoteSend(request: cash.p.beam.BeamQuoteRequest): cash.p.beam.BeamSendQuote =
+        error("Offline quote is outside this controller fixture")
+    override suspend fun signOffline(operationId: String, request: cash.p.beam.BeamQuoteRequest,
+        quoteVersion: String): cash.p.beam.BeamOfflineSignResult = error("Offline signing is outside this controller fixture")
+    override suspend fun exportSignedTransaction(operationId: String): ByteArray =
+        error("Offline export is outside this controller fixture")
+
     override suspend fun previewSend(request: BeamSendRequest): BeamSendPreview = BeamSendPreview(
         requestHash = "hash",
         previewVersion = 1,
@@ -922,5 +930,7 @@ private class FakeDemoSession(
         return resolvedSend
     }
 
+    override suspend fun sendOperations(): List<cash.p.beam.BeamSendOperation> = emptyList()
+    override suspend fun recoverSendOperations(): List<cash.p.beam.BeamSendOperation> = emptyList()
     override suspend fun abortPrepared(operationId: String): Boolean = false
 }

@@ -667,6 +667,12 @@ void runFixture()
     require(reopenedJournal == journal, "Prepared journal changed");
     db->getBlob("beam.sdk.kmp.send.v1.committing", reopenedJournal);
     require(reopenedJournal == journal, "Committing journal changed");
+    require(wallet->IsOfflineTransaction(registering), "malformed SDK records did not fence Core resume");
+    // Finish the malformed-record preservation scenario before testing online callback resume.
+    // Production keeps these records fenced; only this synthetic fixture removes its corruption.
+    db->removeVarRaw("beam.sdk.kmp.send.v1.prepared");
+    db->removeVarRaw("beam.sdk.kmp.send.v1.committing");
+    db->FlushNow();
     size_t eventsBefore = 0;
     db->visitEvents(0, [&](Height, ByteBuffer&&) { ++eventsBefore; return true; });
     Coin recovered; recovered.m_ID = U;

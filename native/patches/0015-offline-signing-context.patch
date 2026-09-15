@@ -1,0 +1,292 @@
+--- a/core/fly_client.h
++++ b/core/fly_client.h
+@@ -99,6 +99,9 @@
+ 			io::Address m_RecoveryExcludedAddress;
+             uint64_t m_WalletEpoch = UINT64_MAX;
+             bool m_RecoveryProof = false;
++            // Opt-in context requests use the existing independent-endpoint recovery transport.
++            bool m_OfflineContext = false;
++            Block::SystemState::Full m_ResponseCheckpoint{};
+ 
+ 			template <typename T>
+ 			T& As()
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -784,52 +784,21 @@
+ 
+ void FlyClient::NetworkStd::OnNewRequests()
+ {
+-    if (m_RequireRecoveryQuorum && !m_lst.empty() && IsRecoveryRequest(*m_lst.front().m_pRequest))
+-    {
+-        std::set<io::Address> liveAddresses;
+-        for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+-        {
+-            Connection& c = *it;
+-            if (c.IsLive() && c.IsSecureOut() && c.IsAtTip() &&
+-                (Connection::Flags::Node & c.m_Flags))
+-                liveAddresses.insert(c.m_Addr);
+-        }
+-        if (liveAddresses.size() < 2)
+-            return;
+-
+-        const auto excludedAddress = m_lst.front().m_pRequest->m_RecoveryExcludedAddress;
+-        Connection* selected = nullptr;
+-        for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+-        {
+-            Connection& c = *it;
+-            if (!c.IsLive() || !c.IsSecureOut() || !c.IsAtTip() ||
+-                !(Connection::Flags::Node & c.m_Flags))
+-                continue;
+-            if (c.m_Addr == excludedAddress)
+-                continue;
+-            selected = &c;
++    // Try each connection once. Unsupported requests remain queued until another
++    // peer can accept them or a login/tip change makes them eligible.
++    for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
++    {
++        if (m_lst.empty())
+             break;
+-        }
+-        if (!selected)
+-            return;
+-        selected->AssignRequests(true);
+-        return;
+-    }
+-
+-    for (ConnectionList::iterator it = m_Connections.begin(); m_Connections.end() != it; ++it)
+-    {
+         Connection& c = *it;
+         if (c.IsLive() && c.IsSecureOut())
+-        {
+-            c.AssignRequests();
+-            break;
+-        }
++            c.AssignRequests(true);
+     }
+ }
+ 
+ bool FlyClient::NetworkStd::IsRecoveryRequest(const Request& request) const
+ {
+-    return request.get_Type() == Request::Type::EnumHdrs ||
++    return request.m_OfflineContext || request.get_Type() == Request::Type::EnumHdrs ||
+         request.get_Type() == Request::Type::ShieldedOutputsAt ||
+         request.get_Type() == Request::Type::BodyPack ||
+         request.get_Type() == Request::Type::Body;
+@@ -838,8 +807,15 @@
+ void FlyClient::NetworkStd::ClearRecoveryResponse(Request& request)
+ {
+     request.m_RecoveryResponder = io::Address();
++    request.m_ResponseCheckpoint = {};
+     switch (request.get_Type())
+     {
++    case Request::Type::ShieldedList:
++        request.As<RequestShieldedList>().m_Res = proto::ShieldedList();
++        break;
++    case Request::Type::ProofShieldedOutp:
++        request.As<RequestProofShieldedOutp>().m_Res = proto::ProofShieldedOutp();
++        break;
+     case Request::Type::EnumHdrs:
+         request.As<RequestEnumHdrs>().m_vStates.clear();
+         break;
+@@ -890,8 +866,7 @@
+     if (!(Flags::Node & m_Flags))
+         return;
+ 
+-    if (!quorumSelected && m_This.m_RequireRecoveryQuorum && !m_This.m_lst.empty() &&
+-        m_This.IsRecoveryRequest(*m_This.m_lst.front().m_pRequest))
++    if (!quorumSelected)
+     {
+         m_This.OnNewRequests();
+         return;
+@@ -908,6 +883,19 @@
+         if (n.m_pRequest->m_pTrg)
+         {
+             lst.pop_front();
++            if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
++            {
++                // Honor each request's quorum/exclusion even behind ordinary work.
++                std::set<io::Address> peers;
++                for (auto& peer : m_This.m_Connections)
++                    if (peer.IsLive() && peer.IsSecureOut() && peer.IsAtTip() &&
++                        (peer.m_Flags & Flags::Node)) peers.insert(peer.m_Addr);
++                if (peers.size() < 2 || m_Addr == n.m_pRequest->m_RecoveryExcludedAddress)
++                {
++                    m_This.m_lst.push_back(n);
++                    continue;
++                }
++            }
+             m_lst.push_back(n);
+             AssignRequest(n);
+         }
+@@ -1456,6 +1444,8 @@
+ 
+         if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
+             n.m_pRequest->m_RecoveryResponder = m_Addr;
++        if (n.m_pRequest->m_OfflineContext)
++            n.m_pRequest->m_ResponseCheckpoint = m_Tip;
+         m_lst.Finish(n);
+     }
+     else
+--- a/wallet/core/base_tx_builder.h
++++ b/wallet/core/base_tx_builder.h
+@@ -31,6 +31,14 @@
+         BaseTxBuilder(BaseTransaction& tx, SubTxID subTxID);
+         virtual ~BaseTxBuilder() = default;
+ 
++        struct ShieldedWindow
++        {
++            Sigma::Cfg m_Cfg;
++            TxoID m_Start = 0;
++            uint32_t m_Count = 0, m_N = 0, m_Index = 0;
++        };
++        static bool SelectShieldedWindow(const ShieldedCoin&, TxoID, ShieldedWindow&);
++
+         BaseTransaction& m_Tx;
+         SubTxID m_SubTxID;
+ 
+--- a/wallet/core/base_tx_builder.cpp
++++ b/wallet/core/base_tx_builder.cpp
+@@ -662,6 +662,52 @@
+ 
+     }
+ 
++    bool BaseTxBuilder::SelectShieldedWindow(const ShieldedCoin& c, TxoID nShieldedCurrently, ShieldedWindow& out)
++    {
++        if (c.m_TxoID >= nShieldedCurrently) return false;
++        ShieldedCoin::UnlinkStatus us(c, nShieldedCurrently);
++
++        bool bWndLost = us.IsLargeSpendWindowLost();
++        out.m_Cfg = bWndLost ?
++            Rules::get().Shielded.m_ProofMin :
++            Rules::get().Shielded.m_ProofMax;
++
++        out.m_N = out.m_Cfg.get_N();
++        if (!out.m_N)
++            return false;
++
++        out.m_Index = c.get_WndIndex(out.m_N);
++
++        if (!bWndLost && (us.m_WndReserve0 < 0))
++        {
++            // move the selected window forward
++            out.m_Index += us.m_WndReserve0; // actually decrease
++            assert(out.m_Index < out.m_N);
++        }
++
++        out.m_Start = c.m_TxoID - out.m_Index;
++        out.m_Count = out.m_N;
++
++        TxoID nWndEnd = out.m_Start + out.m_N;
++        if (nWndEnd > nShieldedCurrently)
++        {
++            // move the selected window backward
++            uint32_t nExtra = static_cast<uint32_t>(nWndEnd - nShieldedCurrently);
++            if (nExtra < out.m_Start)
++                out.m_Start -= nExtra;
++            else
++            {
++                nExtra = static_cast<uint32_t>(out.m_Start);
++                out.m_Start = 0;
++            }
++
++            out.m_Index += nExtra;
++            out.m_Count += nExtra;
++        }
++
++        return true;
++    }
++
+     bool BaseTxBuilder::HandlerInOuts::HandlerInputShielded::InvokeSafe(BaseTxBuilder& b, const IPrivateKeyKeeper2::ShieldedInput& si)
+     {
+         // currently process inputs 1-by-1
+@@ -679,45 +725,13 @@
+         TxoID nShieldedCurrently = b.m_Tx.GetWalletDB()->get_ShieldedOuts();
+         std::setmax(nShieldedCurrently, c.m_TxoID + 1); // assume stored shielded count may be inaccurate, the being-spent element must be present
+ 
+-        ShieldedCoin::UnlinkStatus us(c, nShieldedCurrently);
+-
+-        bool bWndLost = us.IsLargeSpendWindowLost();
+-        m_Method.m_pKernel->m_SpendProof.m_Cfg = bWndLost ?
+-            Rules::get().Shielded.m_ProofMin :
+-            Rules::get().Shielded.m_ProofMax;
+-
+-        m_N = m_Method.m_pKernel->m_SpendProof.m_Cfg.get_N();
+-        if (!m_N)
+-            return false;
+-
+-        m_Method.m_iIdx = c.get_WndIndex(m_N);
+-
+-        if (!bWndLost && (us.m_WndReserve0 < 0))
+-        {
+-            // move the selected window forward
+-            m_Method.m_iIdx += us.m_WndReserve0; // actually decrease
+-            assert(m_Method.m_iIdx < m_N);
+-        }
+-
+-        m_Wnd0 = c.m_TxoID - m_Method.m_iIdx;
+-        m_Count = m_N;
+-
+-        TxoID nWndEnd = m_Wnd0 + m_N;
+-        if (nWndEnd > nShieldedCurrently)
+-        {
+-            // move the selected window backward
+-            uint32_t nExtra = static_cast<uint32_t>(nWndEnd - nShieldedCurrently);
+-            if (nExtra < m_Wnd0)
+-                m_Wnd0 -= nExtra;
+-            else
+-            {
+-                nExtra = static_cast<uint32_t>(m_Wnd0);
+-                m_Wnd0 = 0;
+-            }
+-
+-            m_Method.m_iIdx += nExtra;
+-            m_Count += nExtra;
+-        }
++        ShieldedWindow window;
++        if (!SelectShieldedWindow(c, nShieldedCurrently, window)) return false;
++        m_Method.m_pKernel->m_SpendProof.m_Cfg = window.m_Cfg;
++        m_Method.m_iIdx = window.m_Index;
++        m_N = window.m_N;
++        m_Wnd0 = window.m_Start;
++        m_Count = window.m_Count;
+ 
+         BEAM_LOG_INFO() << "ShieldedInput window N=" << m_N << ", Wnd0=" << m_Wnd0 << ", iIdx=" << m_Method.m_iIdx << ", TxoID=" << c.m_TxoID << ", PoolSize=" << nShieldedCurrently;
+ 
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -167,6 +167,9 @@
+         uint64_t TransactionEpoch() const { return m_TransactionEpoch; }
+         bool CanProcessTransaction(const BaseTransaction&) const;
+         void ConfigureRecoveryQuorum();
++        // Owner-thread notification only; false fences context work before tip/recovery changes.
++        // Does not alter transaction admission, active membership, or startup resume.
++        std::function<void(bool)> m_OfflineContextChanged;
+         void RecordSnapshotImport(const Block::SystemState::Full&);
+         void VisitActiveTransaction(const TxVisitor& visitor);
+ 
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -2217,6 +2217,7 @@
+ 
+     void Wallet::CloseRecoveryAdmission()
+     {
++        if (m_OfflineContextChanged) m_OfflineContextChanged(false);
+         if (!m_RecoveryPolicy) return;
+         m_RecoveryAdmission = false;
+         m_RecoveryLiveTip = false;
+@@ -3147,6 +3148,7 @@
+ 
+     void Wallet::OnNewTip()
+     {
++        if (m_OfflineContextChanged) m_OfflineContextChanged(false);
+         if (m_RecoveryPolicy && !m_RecoveryAdmission)
+         {
+             if (m_RecoveryLiveQuorumPending)
+@@ -3313,6 +3315,7 @@
+         const bool recoveryReady = !m_RecoveryPolicy || FinishRecognitionRecovery();
+         NotifySyncProgress();
+         if (!recoveryReady) return;
++        if (m_OfflineContextChanged) m_OfflineContextChanged(true);
+ 
+         if (!IsValidTimeStamp(sTip.m_TimeStamp))
+         {
