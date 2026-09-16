@@ -616,8 +616,9 @@ private data class AddressDto(val token: String, val type: String, val network: 
     )
 }
 
+// Internal rather than private so the jvmShared test source set can decode payloads directly.
 @Serializable
-private data class TransactionDto(
+internal data class TransactionDto(
     val id: String,
     val direction: String,
     val amount: Long,
@@ -628,6 +629,7 @@ private data class TransactionDto(
     val kernelId: String? = null,
     val status: String,
     val failureReason: String? = null,
+    val counterparty: String? = null,
 ) {
     fun toDomain(): BeamTransaction = BeamTransaction(
         id = id,
@@ -640,6 +642,7 @@ private data class TransactionDto(
         kernelId = kernelId,
         status = BeamTransactionStatus.valueOf(status),
         failureReason = failureReason,
+        counterparty = counterparty,
     )
 }
 

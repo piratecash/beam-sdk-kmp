@@ -135,6 +135,10 @@ public data class BeamTransaction(
     val kernelId: String?,
     val status: BeamTransactionStatus,
     val failureReason: String?,
+    // The other party, in whatever form beam core holds it: a payment token, a base58 endpoint, or a
+    // wallet id as hex. Null when the protocol reports none. Display only - parse or send to none of
+    // these forms; an endpoint in particular is an identity key, not a payable address.
+    val counterparty: String? = null,
 )
 
 public data class BeamTransactionPage(

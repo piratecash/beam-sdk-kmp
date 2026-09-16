@@ -251,6 +251,7 @@ public:
 
     static void run() {
         runInventoryRecovery();
+        runCounterpartyJson();
         {
             SendAdmissionFixture f;
             const auto a = f.prepare("A");
@@ -406,6 +407,76 @@ public:
             const auto b = f.prepare("B");
             f.commit("B");
             checkAdmissionTest(f.hasRow(b), "Incoming history incorrectly blocked send");
+        }
+    }
+
+    // The history JSON must carry the other party of the transaction, and must report an absent one
+    // as JSON null with the key still present - an omitted key is indistinguishable from a null for
+    // a decoder with a default, and an empty string would render as a blank address row.
+    static void runCounterpartyJson() {
+        // nlohmann 3.1.2 has no contains(), and its non-const operator[] INSERTS a null for a missing
+        // key, so presence must be asserted through find() before the value is read.
+        const auto counterpartyOf = [](const Json& json) {
+            const auto found = json.find("counterparty");
+            checkAdmissionTest(found != json.end(), "counterparty key absent from transaction JSON");
+            return *found;
+        };
+        const auto store = [](SendAdmissionFixture& f, const TxDescription& tx) {
+            f.session_.database_->saveTx(tx);
+            flushDatabase(f.session_.database_);
+        };
+        // A TxDescription built in-process carries no parameter map; only the stored-and-reloaded
+        // description resolves getAddressFrom()/getAddressTo().
+        const auto reload = [](SendAdmissionFixture& f, const TxID& txId) {
+            const auto stored = f.session_.database_->getTx(txId);
+            checkAdmissionTest(bool(stored), "Stored transaction could not be read back");
+            return transactionJson(TransactionSnapshot{*stored, 0});
+        };
+        // m_sender is set explicitly in every case: the parameterised constructor defaults it to true
+        // while the defaulted one leaves the in-class false.
+        const auto describe = [](bool sender) {
+            TxDescription tx(beam::wallet::GenerateTxID(), TxType::PushTransaction);
+            tx.m_sender = sender;
+            tx.m_status = TxStatus::Completed;
+            tx.m_createTime = 1'700'000'000; // getTx() returns nothing unless CreateTime is persisted.
+            return tx;
+        };
+
+        { // Receiver side with a sender endpoint: report that endpoint.
+            SendAdmissionFixture f;
+            const auto tx = describe(false);
+            store(f, tx);
+            beam::PeerID endpoint;
+            endpoint = 8675309UL;
+            beam::wallet::storage::setTxParameter(
+                *f.session_.database_, tx.m_txId, TxParameterID::PeerEndpoint, endpoint, false);
+            flushDatabase(f.session_.database_);
+            checkAdmissionTest(counterpartyOf(reload(f, tx.m_txId)) == std::to_base58(endpoint),
+                "Receiver-side counterparty did not report the sender endpoint");
+        }
+        { // Receiver side with no endpoint and a zero peer address: an anonymous sender is null.
+            SendAdmissionFixture f;
+            const auto tx = describe(false);
+            store(f, tx);
+            checkAdmissionTest(counterpartyOf(reload(f, tx.m_txId)).is_null(),
+                "Anonymous sender was not reported as JSON null");
+        }
+        { // Sender side with the original token: report the token verbatim.
+            SendAdmissionFixture f;
+            const auto tx = describe(true);
+            store(f, tx);
+            beam::wallet::storage::setTxParameter(
+                *f.session_.database_, tx.m_txId, TxParameterID::OriginalToken, f.receiver_, false);
+            flushDatabase(f.session_.database_);
+            checkAdmissionTest(counterpartyOf(reload(f, tx.m_txId)) == f.receiver_,
+                "Sender-side counterparty did not report the stored receiver token");
+        }
+        { // Sender side with no token and a zero peer address: nothing to report is null.
+            SendAdmissionFixture f;
+            const auto tx = describe(true);
+            store(f, tx);
+            checkAdmissionTest(counterpartyOf(reload(f, tx.m_txId)).is_null(),
+                "Missing receiver token was not reported as JSON null");
         }
     }
 

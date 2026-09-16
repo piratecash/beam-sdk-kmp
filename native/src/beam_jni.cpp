@@ -558,6 +558,11 @@ Json transactionJson(const TransactionSnapshot& snapshot) {
     const auto& transaction = snapshot.transaction;
     std::string kernelId;
     if (transaction.m_kernelID != beam::Zero) kernelId = std::to_string(transaction.m_kernelID);
+    // The other party, taken from whichever side we are not. An absent one is protocol-sanctioned:
+    // a sender may stay anonymous, so it travels as JSON null and must never become a placeholder.
+    const std::string counterparty = transaction.m_sender
+        ? transaction.getAddressTo()
+        : transaction.getAddressFrom();
     return {
         {"id", txIdString(transaction.m_txId)},
         {"direction", transaction.m_selfTx ? "Self" : (transaction.m_sender ? "Outgoing" : "Incoming")},
@@ -567,6 +572,7 @@ Json transactionJson(const TransactionSnapshot& snapshot) {
         {"minHeight", transaction.m_minHeight == 0 ? Json(nullptr) : Json(transaction.m_minHeight)},
         {"proofHeight", snapshot.proofHeight == 0 ? Json(nullptr) : Json(snapshot.proofHeight)},
         {"kernelId", kernelId.empty() ? Json(nullptr) : Json(kernelId)},
+        {"counterparty", counterparty.empty() ? Json(nullptr) : Json(counterparty)},
         {"status", transactionStatus(transaction.m_status)},
         {"failureReason", transaction.m_status == TxStatus::Failed
             ? Json(std::to_string(static_cast<std::uint32_t>(transaction.m_failureReason)))
