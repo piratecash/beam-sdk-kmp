@@ -13,7 +13,36 @@ public enum class BeamNetwork {
 public data class BeamSdkConfig(
     val network: BeamNetwork,
     val storagePath: String,
-    val logLevel: BeamLogLevel = BeamLogLevel.Info,
+    /**
+     * Beam core logging.
+     *
+     * Defaults to [BeamLogLevel.None]. At any other level the core writes a log file under
+     * `$storagePath/logs`, rotated every three hours and pruned after five days; those logs
+     * contain addresses, amounts and heights, so raise the level deliberately.
+     *
+     * Three properties of this setting are worth knowing before relying on it:
+     * - it is **process-wide**, not per session: Beam core owns a single logger, so the first
+     *   `open`/`create` in a process fixes the level and the log directory, and a later call with
+     *   a different level is ignored;
+     * - it is **best-effort**: if the log directory cannot be created or written, the wallet opens
+     *   normally with logging disabled rather than failing;
+     * - [BeamLogLevel.None] writes nothing at all, to any sink;
+     * - [BeamLogLevel.Debug] does not add DEBUG lines to a released build. The published natives
+     *   are compiled with `NDEBUG`, which turns core's `BEAM_LOG_DEBUG` into a no-op stub, so
+     *   Debug and [BeamLogLevel.Info] produce the same file there. The distinction is real only
+     *   for a locally built debug native.
+     */
+    val logLevel: BeamLogLevel = BeamLogLevel.None,
+    /**
+     * Requires two independent nodes to return an identical recovery body pack before the wallet
+     * trusts it.
+     *
+     * Off by default, matching the official Beam wallet, which accepts single-node trust for
+     * recovery. With it on, a wallet that cannot reach two nodes that are simultaneously live,
+     * secured, at the chain tip and node-flagged will not finish its body scan; that condition is
+     * reported as [BeamFailure.Quorum] rather than stalling silently.
+     */
+    val requireRecoveryQuorum: Boolean = false,
 )
 
 public enum class BeamLogLevel {

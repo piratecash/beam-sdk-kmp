@@ -25,7 +25,7 @@ public:
     SendAdmissionFixture()
         : directory_(std::filesystem::temp_directory_path() /
               ("beam-send-admission-" + txIdString(beam::wallet::GenerateTxID()))),
-          session_(1, directory_.string()), rulesScope_(session_.rules_),
+          session_(1, directory_.string(), false, 0), rulesScope_(session_.rules_),
           reactorScope_(*session_.reactor_) {
         std::filesystem::create_directory(directory_);
         ECC::NoLeak<ECC::uintBig> seed;

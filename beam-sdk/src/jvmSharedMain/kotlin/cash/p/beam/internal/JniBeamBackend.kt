@@ -88,6 +88,7 @@ private class JniBeamBackend : BeamBackend {
                 restoreType = restoreConfiguration.first,
                 restoreValue = restoreConfiguration.second,
                 logLevel = config.logLevel.ordinal,
+                requireRecoveryQuorum = config.requireRecoveryQuorum,
             )
         }
         checkValidHandle()
@@ -112,6 +113,7 @@ private class JniBeamBackend : BeamBackend {
                 databaseKey = databaseKey,
                 network = config.network.ordinal,
                 logLevel = config.logLevel.ordinal,
+                requireRecoveryQuorum = config.requireRecoveryQuorum,
             )
         }
         checkValidHandle()
@@ -503,8 +505,15 @@ internal object BeamNative {
         restoreType: Int,
         restoreValue: String,
         logLevel: Int,
+        requireRecoveryQuorum: Boolean,
     ): Long
-    external fun open(storagePath: String, databaseKey: ByteArray, network: Int, logLevel: Int): Long
+    external fun open(
+        storagePath: String,
+        databaseKey: ByteArray,
+        network: Int,
+        logLevel: Int,
+        requireRecoveryQuorum: Boolean,
+    ): Long
     external fun snapshotRestoreIntent(handle: Long): String
     external fun start(handle: Long)
     external fun stop(handle: Long)

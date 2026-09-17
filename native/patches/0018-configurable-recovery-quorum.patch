@@ -1,0 +1,465 @@
+diff --git a/core/fly_client.cpp b/core/fly_client.cpp
+index 19d0d22..8574149 100644
+--- a/core/fly_client.cpp
++++ b/core/fly_client.cpp
+@@ -796,6 +796,32 @@ void FlyClient::NetworkStd::OnNewRequests()
+     }
+ }
+ 
++// Two minutes of a wholly stalled recovery scan. Storage is unconditional; only the setter that
++// lowers it is compiled under BEAM_SDK_KMP_TESTS, because `core` never receives that macro.
++uint32_t FlyClient::NetworkStd::s_RecoveryParkReportThreshold_ms = 120000;
++
++void FlyClient::NetworkStd::OnRecoveryParked()
++{
++    // GetTimeNnz_ms never returns 0, so 0 stays a usable "nothing parked" sentinel.
++    if (!m_RecoveryParkSince)
++        m_RecoveryParkSince = GetTimeNnz_ms();
++    else if (!m_RecoveryParkReported &&
++        GetTimeNnz_ms() - m_RecoveryParkSince >= s_RecoveryParkReportThreshold_ms)
++    {
++        m_RecoveryParkReported = true;
++        // Unset whenever the transport was armed without a wallet behind it, e.g. a direct
++        // SetRecoveryQuorum in a transport-level test. Parking then stays silent, as before.
++        if (m_RecoveryParkReport)
++            m_RecoveryParkReport("Beam recovery stalled: fewer than two nodes qualify for the quorum");
++    }
++}
++
++void FlyClient::NetworkStd::OnRecoveryAssigned()
++{
++    m_RecoveryParkSince = 0;
++    m_RecoveryParkReported = false;
++}
++
+ bool FlyClient::NetworkStd::IsRecoveryRequest(const Request& request) const
+ {
+     return request.m_OfflineContext || request.get_Type() == Request::Type::EnumHdrs ||
+@@ -883,18 +909,32 @@ void FlyClient::NetworkStd::Connection::AssignRequests(bool quorumSelected)
+         if (n.m_pRequest->m_pTrg)
+         {
+             lst.pop_front();
+-            if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
++            if (m_This.IsRecoveryRequest(*n.m_pRequest))
+             {
+-                // Honor each request's quorum/exclusion even behind ordinary work.
++                // Two independent reasons to hold a recovery request back, deliberately not
++                // merged. The peer COUNT is the embedder's quorum policy. The exclusion is a
++                // property of the request itself: whoever re-posted it already has one peer's
++                // answer and must not be handed the same peer again. OfflineContext relies on
++                // that failover and has nothing to do with the quorum switch.
+                 std::set<io::Address> peers;
+                 for (auto& peer : m_This.m_Connections)
+                     if (peer.IsLive() && peer.IsSecureOut() && peer.IsAtTip() &&
+                         (peer.m_Flags & Flags::Node)) peers.insert(peer.m_Addr);
+-                if (peers.size() < 2 || m_Addr == n.m_pRequest->m_RecoveryExcludedAddress)
++                const bool quorumShort = m_This.m_RequireRecoveryQuorum && peers.size() < 2;
++                const bool excluded = (m_Addr == n.m_pRequest->m_RecoveryExcludedAddress);
++                if (quorumShort || excluded)
+                 {
++                    // Only a policy stall is reported. ReportBodyQuorumFailure is terminal - it
++                    // closes recovery admission and fails the session - so an exclusion bounce
++                    // must never reach it: with the quorum off that would turn a stalled offline
++                    // context, which surfaces on its own non-fatal channel, into the very
++                    // session-wide quorum failure this switch exists to prevent.
++                    if (quorumShort)
++                        m_This.OnRecoveryParked();
+                     m_This.m_lst.push_back(n);
+                     continue;
+                 }
++                m_This.OnRecoveryAssigned();
+             }
+             m_lst.push_back(n);
+             AssignRequest(n);
+@@ -919,7 +959,10 @@ void FlyClient::NetworkStd::Connection::AssignRequest(RequestNode& n)
+         return;
+     }
+ 
+-    if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
++    // Unconditional for recovery requests: a re-send must never carry the previous responder's
++    // answer into the comparison, and that is true whether the re-send came from the quorum or
++    // from OfflineContext's own failover.
++    if (m_This.IsRecoveryRequest(*n.m_pRequest))
+         m_This.ClearRecoveryResponse(*n.m_pRequest);
+ 
+     switch (n.m_pRequest->get_Type())
+@@ -1442,7 +1485,11 @@ void FlyClient::NetworkStd::Connection::OnDone(RequestNode& n, bool bMaybeRetry
+             return;
+         }
+ 
+-        if (m_This.m_RequireRecoveryQuorum && m_This.IsRecoveryRequest(*n.m_pRequest))
++        // Recorded for every recovery request, armed or not. OfflineContext requires a non-empty
++        // responder on each response (native/src/offline_context.cpp) and compares the two halves
++        // by it; the wallet's own quorum comparisons read the same field but only when armed, so
++        // recording it unconditionally costs one assignment and unbreaks offline signing.
++        if (m_This.IsRecoveryRequest(*n.m_pRequest))
+             n.m_pRequest->m_RecoveryResponder = m_Addr;
+         if (n.m_pRequest->m_OfflineContext)
+             n.m_pRequest->m_ResponseCheckpoint = m_Tip;
+diff --git a/core/fly_client.h b/core/fly_client.h
+index ef78cd6..37deca5 100644
+--- a/core/fly_client.h
++++ b/core/fly_client.h
+@@ -237,10 +237,22 @@ namespace proto {
+             // Checked at the last send/re-send boundary, including queued registrations.
+             std::function<bool(const Request&)> m_RequestAdmission;
+             std::function<uint64_t()> m_RequestEpoch;
++            // Invoked once when a recovery request has been parked for longer than
++            // s_RecoveryParkReportThreshold_ms because fewer than two peers qualify. Optional:
++            // a transport armed directly, without a wallet, leaves it unset and keeps parking
++            // silently, so every call site must check it before invoking.
++            std::function<void(const char*)> m_RecoveryParkReport;
++            // Storage is unconditional: this header is compiled into `core`, which never receives
++            // BEAM_SDK_KMP_TESTS, so a macro-guarded member would be invisible to the gate.
++            static uint32_t s_RecoveryParkReportThreshold_ms;
+ #ifdef BEAM_SDK_KMP_TESTS
+             static void ClearRecoveryResponseForTests(Request& request) {
+                 ClearRecoveryResponse(request);
+             }
++            // Tests lower the threshold and restore it afterwards; the storage is process-global.
++            static void SetRecoveryParkReportThresholdForTests(uint32_t value) {
++                s_RecoveryParkReportThreshold_ms = value;
++            }
+ #endif
+ 
+ 			struct Config {
+@@ -377,7 +389,14 @@ namespace proto {
+ 			typedef boost::intrusive::list<Connection> ConnectionList;
+ 			ConnectionList m_Connections;
+ 			bool m_RequireRecoveryQuorum = false;
++			// First park of the current streak, in GetTime_ms() units; 0 while nothing is parked.
++			uint32_t m_RecoveryParkSince = 0;
++			bool m_RecoveryParkReported = false;
+ 			bool IsRecoveryRequest(const Request&) const;
++			// Called on every park with fewer than two qualifying peers, and on every successful
++			// recovery assignment, which clears the streak.
++			void OnRecoveryParked();
++			void OnRecoveryAssigned();
+             static void ClearRecoveryResponse(Request&);
+ 
+ 			Connection* get_ActiveConnection();
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 6df7644..1a7dff2 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -273,6 +273,14 @@ namespace beam::wallet
+     {
+         if (m_ExecutionMode == ExecutionMode::Offline) throw std::runtime_error("Offline owner forbids network");
+         m_NodeEndpoint = std::move(nodeEndpoint);
++        // A replaced endpoint starts disarmed and reporterless. Without this the wallet would
++        // keep m_RecoveryQuorumRequired == true while the new transport gates nothing, which is
++        // the one call order that can still half-arm the pair.
++        if (auto network = std::dynamic_pointer_cast<proto::FlyClient::NetworkStd>(m_NodeEndpoint))
++        {
++            network->SetRecoveryQuorum(m_RecoveryQuorumRequired);
++            InstallRecoveryParkReporter(*network);
++        }
+     }
+ 
+     proto::FlyClient::INetwork::Ptr  Wallet::GetNodeEndpoint() const
+@@ -1659,14 +1667,19 @@ namespace beam::wallet
+ 
+     void Wallet::OnRequestComplete(MyRequestShieldedOutputsAt& r)
+     {
+-        if (!CheckShieldedBoundaryQuorum(r))
++        // Gated whole: the function is pure peer comparison and returns false on a first
++        // response in order to re-post, so an m_QuorumAccepted-style guard here would accept a
++        // single responder while the quorum is armed.
++        if (m_RecoveryQuorumRequired && !CheckShieldedBoundaryQuorum(r))
+             return;
+         r.m_callback(r.m_Msg.m_Height, r.m_Res.m_ShieldedOuts);
+     }
+ 
+     void Wallet::OnRequestComplete(MyRequestEnumHdrs& r)
+     {
+-        if (!CheckHistoricalHeaderQuorum(r))
++        if (!ValidateHistoricalHeaderResponse(r))
++            return;
++        if (m_RecoveryQuorumRequired && !CheckHistoricalHeaderQuorum(r))
+             return;
+         const auto& state = r.m_vStates.front();
+         if (r.m_RecoveryCallback) r.m_RecoveryCallback(state);
+@@ -1810,7 +1823,9 @@ namespace beam::wallet
+             return;
+         if (m_RecoveryPolicy && (r.m_StartHeight != GetEventsHeightNext() ||
+             r.m_Res.m_Bodies.size() > r.m_Msg.m_CountExtra.v + 1)) return;
+-        if (!r.m_QuorumAccepted && !CheckBodyPackQuorum(r))
++        if (!ValidateBodyPackResponse(r))
++            return;
++        if (m_RecoveryQuorumRequired && !r.m_QuorumAccepted && !CheckBodyPackQuorum(r))
+             return;
+         r.m_QuorumAccepted = true;
+         if (!EnsureRecoveryCursor(r.m_StartHeight + r.m_Res.m_Bodies.size() - 1,
+@@ -1881,7 +1896,7 @@ namespace beam::wallet
+             return;
+         if (m_RecoveryPolicy && (r.m_Height ? r.m_Height != GetEventsHeightNext() : m_IsTreasuryHandled))
+             return;
+-        if (!r.m_QuorumAccepted && !CheckBodyQuorum(r))
++        if (m_RecoveryQuorumRequired && !r.m_QuorumAccepted && !CheckBodyQuorum(r))
+             return;
+         r.m_QuorumAccepted = true;
+         if (!EnsureRecoveryCursor(r.m_Height,
+@@ -2039,19 +2054,56 @@ namespace beam::wallet
+         return false;
+     }
+ 
+-    bool Wallet::CheckBodyPackQuorum(MyRequestBodyPack& request)
++    void Wallet::RepeatBodyPackRequest(MyRequestBodyPack& request)
+     {
+-        if (request.m_Res.m_Bodies.empty())
++        MyRequestBodyPack::Ptr repeated(new MyRequestBodyPack);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_StartHeight = request.m_StartHeight;
++        repeated->m_RecoveryGeneration = request.m_RecoveryGeneration;
++        // Only when we are actually after a second opinion. The transport honours an exclusion
++        // whatever the policy says, so asking to avoid the responder while the quorum is off and
++        // only one peer qualifies parks the retry forever: no callback, m_PendingBodyPack never
++        // clears, RequestBodies early-returns on m_WaitingRecoveryCursor, and the scan stalls
++        // silently - the exact failure this whole change removes. With the quorum off, re-asking
++        // the same node is what a single-node wallet is supposed to do, and the retry bound then
++        // still fires its terminal verdict after three bad answers.
++        if (m_RecoveryQuorumRequired)
++            repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
++        ++m_BodyPackQuorumRequests;
++        PostReqUnique(*repeated);
++    }
++
++    // Runs whether or not the quorum is armed. An empty pack makes no progress, so accepting it
++    // would spin the body scan forever; the retry counter bounds that in both configurations.
++    bool Wallet::ValidateBodyPackResponse(MyRequestBodyPack& request)
++    {
++        if (!request.m_Res.m_Bodies.empty())
+         {
+-            m_BodyPackCandidate = boost::none;
+-            m_BodyPackCandidatePeer = io::Address();
+-            if (++m_BodyPackQuorumRetries > 2)
+-            {
+-                ReportBodyQuorumFailure("Beam node returned an empty recovery body pack");
+-                return false;
+-            }
++            // The bound is on CONSECUTIVE empty packs. Its only other reset lives in
++            // CheckBodyPackQuorum, which does not run when the quorum is off, so without this a
++            // handful of empty packs scattered over an hours-long scan would accumulate to three
++            // and fail the session terminally. The reset is conditional because when the quorum
++            // IS armed the counter is shared with the mismatch bound, whose success condition is
++            // the stronger one (two peers agreed) and must remain the only thing that clears it.
++            if (!m_RecoveryQuorumRequired) m_BodyPackQuorumRetries = 0;
++            return true;
+         }
+-        else
++
++        m_BodyPackCandidate = boost::none;
++        m_BodyPackCandidatePeer = io::Address();
++        if (++m_BodyPackQuorumRetries > 2)
++        {
++            ReportBodyQuorumFailure("Beam node returned an empty recovery body pack");
++            return false;
++        }
++        RepeatBodyPackRequest(request);
++        return false;
++    }
++
++    // Peer comparison only; the caller runs it solely when the quorum is armed, and only after
++    // ValidateBodyPackResponse has established the pack is non-empty.
++    bool Wallet::CheckBodyPackQuorum(MyRequestBodyPack& request)
++    {
+         {
+             auto digest = BodyPackDigest(request.m_Res);
+             if (!m_BodyPackCandidate)
+@@ -2079,13 +2131,7 @@ namespace beam::wallet
+             }
+         }
+ 
+-        MyRequestBodyPack::Ptr repeated(new MyRequestBodyPack);
+-        repeated->m_Msg = request.m_Msg;
+-        repeated->m_StartHeight = request.m_StartHeight;
+-        repeated->m_RecoveryGeneration = request.m_RecoveryGeneration;
+-        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+-        ++m_BodyPackQuorumRequests;
+-        PostReqUnique(*repeated);
++        RepeatBodyPackRequest(request);
+         return false;
+     }
+ 
+@@ -2124,25 +2170,51 @@ namespace beam::wallet
+         return false;
+     }
+ 
+-    bool Wallet::CheckHistoricalHeaderQuorum(MyRequestEnumHdrs& request)
++    void Wallet::RepeatHistoricalHeaderRequest(MyRequestEnumHdrs& request)
+     {
+-        HeightHash id;
+-        const bool valid = request.m_vStates.size() == 1 &&
+-            request.m_vStates.front().get_Height() == request.m_Msg.m_Height.m_Min;
+-        if (valid)
+-            request.m_vStates.front().get_ID(id);
++        MyRequestEnumHdrs::Ptr repeated(new MyRequestEnumHdrs);
++        repeated->m_Msg = request.m_Msg;
++        repeated->m_callback = request.m_callback;
++        repeated->m_RecoveryCallback = request.m_RecoveryCallback;
++        // Same reasoning as RepeatBodyPackRequest: with the quorum off an exclusion the network
++        // cannot satisfy leaves m_WaitingRecoveryCursor stuck true forever.
++        if (m_RecoveryQuorumRequired)
++            repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
++        PostReqUnique(*repeated);
++    }
+ 
+-        if (!valid)
++    // Runs whether or not the quorum is armed: OnRequestComplete(MyRequestEnumHdrs&) dereferences
++    // m_vStates.front() with no guard of its own, and the transport does deliver empty header
++    // packs, so this shape check is the only thing standing between it and undefined behaviour.
++    bool Wallet::ValidateHistoricalHeaderResponse(MyRequestEnumHdrs& request)
++    {
++        if (request.m_vStates.size() == 1 &&
++            request.m_vStates.front().get_Height() == request.m_Msg.m_Height.m_Min)
+         {
+-            m_HistoricalHeaderCandidate = boost::none;
+-            m_HistoricalHeaderCandidatePeer = io::Address();
+-            if (++m_HistoricalHeaderQuorumRetries > 2)
+-            {
+-                ReportBodyQuorumFailure("Beam nodes could not provide the requested historical header");
+-                return false;
+-            }
++            // Consecutive, and conditional, for the same reason as ValidateBodyPackResponse.
++            if (!m_RecoveryQuorumRequired) m_HistoricalHeaderQuorumRetries = 0;
++            return true;
+         }
+-        else if (!m_HistoricalHeaderCandidate)
++
++        m_HistoricalHeaderCandidate = boost::none;
++        m_HistoricalHeaderCandidatePeer = io::Address();
++        if (++m_HistoricalHeaderQuorumRetries > 2)
++        {
++            ReportBodyQuorumFailure("Beam nodes could not provide the requested historical header");
++            return false;
++        }
++        RepeatHistoricalHeaderRequest(request);
++        return false;
++    }
++
++    // Peer comparison only; the caller runs it solely when the quorum is armed, and only after
++    // ValidateHistoricalHeaderResponse has established the shape.
++    bool Wallet::CheckHistoricalHeaderQuorum(MyRequestEnumHdrs& request)
++    {
++        HeightHash id;
++        request.m_vStates.front().get_ID(id);
++
++        if (!m_HistoricalHeaderCandidate)
+         {
+             m_HistoricalHeaderCandidate = id;
+             m_HistoricalHeaderCandidateTimestamp = request.m_vStates.front().m_TimeStamp;
+@@ -2168,12 +2240,7 @@ namespace beam::wallet
+             }
+         }
+ 
+-        MyRequestEnumHdrs::Ptr repeated(new MyRequestEnumHdrs);
+-        repeated->m_Msg = request.m_Msg;
+-        repeated->m_callback = request.m_callback;
+-        repeated->m_RecoveryCallback = request.m_RecoveryCallback;
+-        repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
+-        PostReqUnique(*repeated);
++        RepeatHistoricalHeaderRequest(request);
+         return false;
+     }
+ 
+@@ -2314,11 +2381,41 @@ namespace beam::wallet
+         }
+     }
+ 
++    void Wallet::InstallRecoveryParkReporter(proto::FlyClient::NetworkStd& network)
++    {
++        std::weak_ptr<uint8_t> lifetime = m_RecoveryLifetime;
++        network.m_RecoveryParkReport = [this, lifetime](const char* message) {
++            if (lifetime.expired()) return;
++            ReportBodyQuorumFailure(message);
++        };
++    }
++
++    void Wallet::SetRecoveryQuorumRequired(bool required)
++    {
++        m_RecoveryQuorumRequired = required;
++
++        auto network = std::dynamic_pointer_cast<proto::FlyClient::NetworkStd>(m_NodeEndpoint);
++        // No endpoint yet: ConfigureRecoveryQuorum will arm the transport from the member below.
++        if (!network) return;
++
++        // Pushing here is what removes the ordering requirement. WalletClient::start runs
++        // ConfigureRecoveryQuorum before the embedder can reach the wallet at all, so a setter
++        // that only wrote the member would arm the wallet-side comparisons and leave the
++        // transport gate off.
++        network->SetRecoveryQuorum(required);
++        // An armed transport must always have a reporter, otherwise a parked request is a silent
++        // hang. An "Existing" wallet never runs ConfigureRecoveryQuorum (wallet_client.cpp guards
++        // it on RecoveryPolicyEnabled) yet still posts body requests, which IsRecoveryRequest
++        // classifies by type, so installing the reporter only there would miss exactly that case.
++        InstallRecoveryParkReporter(*network);
++    }
++
+     void Wallet::ConfigureRecoveryQuorum()
+     {
+         auto network = std::dynamic_pointer_cast<proto::FlyClient::NetworkStd>(m_NodeEndpoint);
+         if (!network) throw std::runtime_error("Recovery requires quorum network");
+-        network->SetRecoveryQuorum(true);
++        network->SetRecoveryQuorum(m_RecoveryQuorumRequired);
++        InstallRecoveryParkReporter(*network);
+         std::weak_ptr<uint8_t> lifetime = m_RecoveryLifetime;
+         network->m_RequestAdmission = [this, lifetime](const Request& r) {
+             return !lifetime.expired() && r.m_WalletEpoch == m_TransactionEpoch && AllowRequest(r);
+@@ -2457,8 +2554,9 @@ namespace beam::wallet
+         {
+             if (!m_RecoveryLiveQuorumPending)
+             {
+-                // Reopen/completion with no remaining bodies still requires two live peers.
+-                // Configuration and a recent cached timestamp alone are not quorum evidence.
++                // Reopen/completion with no remaining bodies re-confirms the live tip against
++                // a header the node serves now. Configuration and a recent cached timestamp
++                // alone are not evidence. With the quorum armed this also requires two peers.
+                 MyRequestEnumHdrs::Ptr request(new MyRequestEnumHdrs);
+                 request->m_Msg.m_Height = live.m_Height;
+                 request->m_RecoveryCallback = [this, live](const Block::SystemState::Full& header) {
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+index 5f4795a..6b79e5b 100644
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -176,6 +176,15 @@ namespace beam::wallet
+             BaseTransaction::Creator::Ptr, std::function<bool()> admission);
+         void EndOfflineTransaction();
+         void ConfigureRecoveryQuorum();
++        // The single source of truth for the recovery quorum. Off by default, matching the
++        // official wallet, which accepts single-node trust for recovery bodies.
++        //
++        // Pushes straight to the node endpoint and installs the park reporter, so no call order
++        // can leave the transport gate and the wallet-side comparisons disagreeing. That matters
++        // because the SDK can only reach the wallet after WalletClient::start has already run
++        // ConfigureRecoveryQuorum, and because an "Existing" wallet never runs it at all.
++        void SetRecoveryQuorumRequired(bool required);
++        bool RecoveryQuorumRequired() const { return m_RecoveryQuorumRequired; }
+         // Owner-thread notification only; false fences context work before tip/recovery changes.
+         // Does not alter transaction admission, active membership, or startup resume.
+         std::function<void(bool)> m_OfflineContextChanged;
+@@ -378,6 +387,7 @@ namespace beam::wallet
+         bool m_RecoveryPolicy = false;
+         bool m_RecoveryAdmission = false;
+         bool m_RecoveryQuorumConfigured = false;
++        bool m_RecoveryQuorumRequired = false;
+         bool m_RecoveryFailure = false;
+         bool m_RecoveryLiveTip = false;
+         uint64_t m_TransactionEpoch = 0;
+@@ -564,6 +574,17 @@ namespace beam::wallet
+         bool CheckBodyPackQuorum(MyRequestBodyPack& request);
+         bool CheckShieldedBoundaryQuorum(MyRequestShieldedOutputsAt& request);
+         bool CheckHistoricalHeaderQuorum(MyRequestEnumHdrs& request);
++        // Validation runs whether or not the quorum is armed: the handlers below dereference
++        // these responses, and the transport can deliver an empty pack. Only the peer comparison
++        // above is gated.
++        bool ValidateHistoricalHeaderResponse(MyRequestEnumHdrs& request);
++        bool ValidateBodyPackResponse(MyRequestBodyPack& request);
++        void RepeatHistoricalHeaderRequest(MyRequestEnumHdrs& request);
++        void RepeatBodyPackRequest(MyRequestBodyPack& request);
++        // Only the park reporter. m_RequestAdmission / m_RequestEpoch stay in
++        // ConfigureRecoveryQuorum: installing epoch fencing for a wallet with no recovery policy
++        // would change behaviour that has nothing to do with the quorum.
++        void InstallRecoveryParkReporter(proto::FlyClient::NetworkStd&);
+         void ReportBodyQuorumFailure(const char* message);
+         void ResetBodyQuorumState();
+         void InvalidateBodyRequestsAfterRollback();

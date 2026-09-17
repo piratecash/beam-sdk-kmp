@@ -106,6 +106,166 @@ struct WireNode : proto::NodeConnection::Server {
     ~WireNode() { m_pServer.reset(); peers.clear(); }
 };
 
+
+// The recovery-quorum switch, on the only harness that can reach the park: TestNetwork in
+// snapshot_reorg_recovery_test.cpp overrides PostRequestInternal, so requests there never reach
+// AssignRequests and never see the peer-count gate at all.
+void recoveryQuorumSwitchCases(NodeProcessor& node) {
+    using Fly = proto::FlyClient;
+    struct Client : Fly {
+        Block::SystemState::HistoryMap history;
+        Block::SystemState::IHistory& get_History() override { return history; }
+    } client;
+    client.history.AddStates(&node.m_Cursor.m_Full, 1);
+    struct Handler : Fly::Request::IHandler {
+        unsigned completed = 0;
+        void OnComplete(Fly::Request& r) override { ++completed; r.m_pTrg = nullptr; }
+    } contexts;
+
+    WireNode only(node, WireMode::Accept);
+    only.spreading = false;
+    Fly::NetworkStd network(client);
+    network.m_Cfg.m_vNodes = {io::Address::localhost().port(only.port)};
+    auto ready = [](const auto& c) {
+        return c.IsLive() && c.IsSecureOut() && c.IsAtTip() && (c.m_Flags & Fly::NetworkStd::Connection::Flags::Node);
+    };
+    // An offline-context request. IsRecoveryRequest accepts it through the m_OfflineContext
+    // FLAG, which is how OfflineContext drives its own two-peer replay - not how the wallet's
+    // scan traffic is classified. The type-classified shape is exercised separately below.
+    auto recovery = [&](Fly::RequestShieldedList::Ptr& request) {
+        request = new Fly::RequestShieldedList;
+        request->m_OfflineContext = true;
+        request->m_Msg.m_Id0 = 0; request->m_Msg.m_Count = 1;
+    };
+    // The wallet's own recovery traffic. Wallet::PostReq sets no flag at all, so a body pack is a
+    // recovery request purely by get_Type(); testing only the flag above would leave the type
+    // disjunction in IsRecoveryRequest unprotected, and deleting BodyPack from it would silently
+    // stop gating every body request the scan posts.
+    auto bodyPack = [&](Fly::RequestBodyPack::Ptr& request) {
+        request = new Fly::RequestBodyPack;
+        // Shaped like Wallet::RequestBodies builds it, so the gate sees the real thing.
+        node.m_Cursor.m_Full.get_ID(request->m_Msg.m_Top);
+        request->m_Msg.m_FlagP = proto::BodyBuffers::Recovery1;
+        request->m_Msg.m_FlagE = proto::BodyBuffers::Full;
+        request->m_Msg.m_CountExtra.v = 1;
+    };
+
+    network.Connect();
+    pump([&] { return ready(network.m_Connections.front()); });
+
+    network.SetRecoveryQuorum(false);
+
+    // ---- quorum OFF, but the request excludes the only peer. The exclusion is a property of the
+    // REQUEST - OfflineContext sets it when replaying the second half, and handing the same peer
+    // the replay could only invalidate the context - so it must be honoured whatever the policy
+    // says. It must also NOT be reported: ReportBodyQuorumFailure is terminal, and an exclusion
+    // bounce is normal failover, not a stall.
+    unsigned bounceReports = 0;
+    network.m_RecoveryParkReport = [&](const char*) { ++bounceReports; };
+    Fly::NetworkStd::SetRecoveryParkReportThresholdForTests(0);
+    Fly::RequestShieldedList::Ptr contextual;
+    recovery(contextual);
+    contextual->m_RecoveryExcludedAddress = io::Address::localhost().port(only.port);
+    network.PostRequest(*contextual, contexts);
+    for (unsigned i = 0; i != 5; ++i) tick();
+    network.OnNewRequests();
+    require(network.m_lst.size() == 1 && only.lists == 0,
+        "the quorum switch disabled the request-level peer exclusion");
+    require(bounceReports == 0,
+        "an exclusion bounce was reported as a quorum stall, which fails the whole session");
+    Fly::NetworkStd::SetRecoveryParkReportThresholdForTests(120000);
+    network.m_RecoveryParkReport = nullptr;
+    contextual->m_pTrg = nullptr;
+    network.m_lst.Clear();
+
+    // ---- quorum ON with the same single peer: parked, and reported once it stays parked.
+    // Nothing has been served yet on purpose: with one peer neither a body pack under the armed
+    // quorum nor an offline-context request in any configuration can be assigned, so both
+    // counters are still zero and the drain phase below is what proves service resumes.
+    unsigned reports = 0;
+    network.m_RecoveryParkReport = [&](const char*) { ++reports; };
+    network.SetRecoveryQuorum(true);
+    Fly::RequestShieldedList::Ptr parked;
+    recovery(parked);
+    network.PostRequest(*parked, contexts);
+    for (unsigned i = 0; i != 5; ++i) tick();
+    require(contexts.completed == 0 && only.lists == 0 && network.m_lst.size() == 1,
+        "quorum on served a recovery request from a single peer");
+    require(reports == 0, "a fresh park reported before the threshold elapsed");
+
+    // The threshold is process-global storage; lower it, re-drive the gate, restore it.
+    Fly::NetworkStd::SetRecoveryParkReportThresholdForTests(0);
+    network.OnNewRequests();
+    require(reports == 1, "a park past the threshold went unreported");
+    network.OnNewRequests();
+    network.OnNewRequests();
+    require(reports == 1, "the park report is not latched and fired repeatedly");
+
+    // ---- a second eligible peer drains it, and that clears the streak. The switch goes back OFF
+    // here on purpose: an offline-context request is gated by its own flag either way, so the
+    // drain still happens, and it lets the responder assertion below run in the shipped
+    // configuration rather than the armed one.
+    network.SetRecoveryQuorum(false);
+    WireNode alternate(node, WireMode::Accept);
+    alternate.spreading = false;
+    auto* other = new Fly::NetworkStd::Connection(network);
+    other->m_Addr = io::Address::localhost().port(alternate.port);
+    other->Connect(other->m_Addr);
+    pump([&] { return ready(*other) && contexts.completed == 1; });
+    require(network.m_lst.empty() && reports == 1, "quorum drain reported a stall");
+    // The responder must be recorded even with the quorum off. OfflineContext requires it
+    // non-empty on every response and compares its two replay halves by it, so gating the
+    // recording on the quorum - as this once did - invalidates every offline context the moment
+    // the switch ships off.
+    require(parked->m_RecoveryResponder != io::Address(),
+        "a served recovery request carried no responder, which invalidates every offline context");
+
+    // Re-armed for the reset phase: with the quorum off a request carrying no exclusion is simply
+    // served, so there would be nothing to park and nothing to report.
+    network.SetRecoveryQuorum(true);
+
+    // Streak reset. Asserting "no new report" here would be vacuous: the latch is already set
+    // from the report above, so it holds whether or not the assignment cleared anything. The
+    // reset is only observable as a SECOND report after parking again.
+    other->Reset();
+    delete other;
+    Fly::RequestShieldedList::Ptr again;
+    recovery(again);
+    network.PostRequest(*again, contexts);
+    for (unsigned i = 0; i != 5; ++i) tick();
+    require(network.m_lst.size() == 1 && contexts.completed == 1, "single peer served a recovery request");
+    network.OnNewRequests();
+    require(reports == 2, "a successful assignment did not clear the latch, so the next stall was silent");
+    network.OnNewRequests();
+    require(reports == 2, "the second park report is not latched either");
+    Fly::NetworkStd::SetRecoveryParkReportThresholdForTests(120000);
+
+    // ---- the wallet's own recovery traffic, classified purely by get_Type(). Deliberately last:
+    // the harness node answers GetShieldedList and nothing else, so an assigned body pack stays
+    // in flight forever and eventually costs the connection - harmless here, fatal to any phase
+    // that ran afterwards. Parking is decided before anything is sent, so the distinction shows
+    // as the request leaving (assigned) or staying in (parked) the network-wide list.
+    network.m_lst.Clear();
+    network.SetRecoveryQuorum(true);
+    Fly::RequestBodyPack::Ptr heldBack;
+    bodyPack(heldBack);
+    network.PostRequest(*heldBack, contexts);
+    require(network.m_lst.size() == 1, "quorum on served a body pack from a single peer");
+    heldBack->m_pTrg = nullptr;
+    network.m_lst.Clear();
+
+    network.SetRecoveryQuorum(false);
+    Fly::RequestBodyPack::Ptr assignedPack;
+    bodyPack(assignedPack);
+    network.PostRequest(*assignedPack, contexts);
+    require(network.m_lst.empty(), "quorum off parked a body pack behind a single peer");
+    assignedPack->m_pTrg = nullptr;
+
+    network.m_RecoveryParkReport = nullptr;
+    network.Disconnect();
+    std::cout << "RECOVERY_QUORUM_SWITCH_OK off_serves on_parks reports_once latched resets\n";
+}
+
 // Real secure loopback peers and NetworkStd dispatch. No scheduler/request overrides.
 void schedulerCases(NodeProcessor& node, const ByteBuffer& bytes) {
     using Fly = proto::FlyClient;
@@ -271,6 +431,7 @@ void relayFixture(const std::filesystem::path& dir) {
         corrupt = successful(signer, Inputs::Shielded, recipient.type, Fault::State1);
     }
     schedulerCases(node, captured.bytes);
+    recoveryQuorumSwitchCases(node);
     auto directoryEntries = [&] {
         std::map<std::filesystem::path, ByteBuffer> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {

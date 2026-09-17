@@ -44,7 +44,7 @@ public:
     std::filesystem::path path;
     std::string contextId;
     OfflineSignerFixture(const std::filesystem::path& directory, const Rules& rules)
-        : session(1, directory.string()), retainedReactor(session.reactor_),
+        : session(1, directory.string(), false, 0), retainedReactor(session.reactor_),
           rulesScope((session.rules_ = rules, session.rules_)), reactorScope(*session.reactor_),
           path(directory / "wallet.db") {
         reopen();
@@ -52,7 +52,7 @@ public:
     }
     OfflineSignerFixture(const std::filesystem::path& directory, const Rules& rules,
         NodeProcessor& node, const Funding& funds, Inputs inputs)
-        : session(1, directory.string()), retainedReactor(session.reactor_),
+        : session(1, directory.string(), false, 0), retainedReactor(session.reactor_),
           rulesScope((session.rules_ = rules, session.rules_)),
           reactorScope(*session.reactor_), path(directory / "wallet.db") {
         std::filesystem::create_directory(directory);

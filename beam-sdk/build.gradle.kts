@@ -142,6 +142,15 @@ tasks.register<VerifyNativeArtifactsTask>("verifyNativeArtifacts") {
     )
 }
 
+// Each of these opens a Beam session and asserts on the process-global logger, so each needs a
+// JVM of its own. Kept in one place because desktopTest excludes exactly what desktopLoggingTest
+// includes; a class in neither, or in both, would silently lose the isolation.
+val BEAM_LOGGING_TEST_CLASSES = listOf(
+    "cash.p.beam.internal.CoreLoggingDisabledNativeTest",
+    "cash.p.beam.internal.CoreLoggingEnabledNativeTest",
+    "cash.p.beam.internal.CoreLoggingFirstOpenWinsNativeTest",
+)
+
 tasks.named<Test>("desktopTest") {
     val externalFixtureConfigured =
         providers.environmentVariable("BEAM_SNAPSHOT_REORG_FIXTURE").orNull?.isNotBlank() == true ||
@@ -156,4 +165,27 @@ tasks.named<Test>("desktopTest") {
         outputs.upToDateWhen { false }
         outputs.doNotCacheIf("A desktop JNI fixture test is externally configured") { true }
     }
+    // Beam core freezes its logger on the first open in a process, so a logging assertion is only
+    // meaningful in a JVM no other session has opened. These classes run in desktopLoggingTest.
+    filter { BEAM_LOGGING_TEST_CLASSES.forEach(::excludeTestsMatching) }
 }
+
+// One scenario per class AND one JVM per class: forkEvery alone forks per class, so two scenarios
+// sharing a class would still share a frozen logger.
+val desktopLoggingTest by tasks.registering(Test::class) {
+    val desktop = tasks.named<Test>("desktopTest").get()
+    description = "Runs the Beam core logging tests, each in its own JVM."
+    group = "verification"
+    testClassesDirs = desktop.testClassesDirs
+    classpath = desktop.classpath
+    forkEvery = 1
+    filter {
+        BEAM_LOGGING_TEST_CLASSES.forEach(::includeTestsMatching)
+        isFailOnNoMatchingTests = true
+    }
+    // The native library is neither a source-set input nor a task output here.
+    outputs.upToDateWhen { false }
+    outputs.doNotCacheIf("Loads an externally built native library") { true }
+}
+
+tasks.named("check") { dependsOn(desktopLoggingTest) }

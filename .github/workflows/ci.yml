@@ -82,7 +82,7 @@ jobs:
           BEAM_SNAPSHOT_REORG_FIXTURE="$snapshot_reorg_fixture" \
             BEAM_SEND_ADMISSION_FIXTURE="$send_admission_fixture" \
             BEAM_OFFLINE_HISTORY_FIXTURE="$offline_history_fixture" \
-            ./gradlew :beam-sdk:desktopTest :sample-shared:desktopTest --console=plain
+            ./gradlew :beam-sdk:desktopTest :beam-sdk:desktopLoggingTest :sample-shared:desktopTest --console=plain
       - name: Build production native library
         shell: bash
         run: BEAM_NATIVE_BUILD_DIR=.native-cache/build-host-release ./scripts/build-native-host.sh

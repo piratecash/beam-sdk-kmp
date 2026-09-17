@@ -9,7 +9,7 @@ public:
     static std::vector<std::uint8_t> key() { return std::vector<std::uint8_t>(32, 0x41); }
 
     static void seed(const std::string& directory, int restoreType, bool initialized, bool history) {
-        Session session(1, directory);
+        Session session(1, directory, false, 0);
         std::string value;
         if (restoreType == 0) value = "100";
         if (restoreType == 1) value = "2024-01-01";
@@ -52,7 +52,7 @@ public:
 
 private:
     static Height seedContextWallet(const std::string& directory, bool funded) {
-        Session session(1, directory);
+        Session session(1, directory, false, 0);
         session.create(std::vector<std::uint8_t>(64, 0x31), key(), -1, "");
         Rules::Scope rules(session.rules_);
         beam::io::Reactor::Scope reactor(*session.reactor_);
@@ -125,21 +125,21 @@ public:
         for (int type : {-1, 0, 1, 2, 3}) {
             auto path = directory + "/pending-" + std::to_string(type);
             seed(path, type, false, true);
-            Session pending(1, path);
+            Session pending(1, path, false, 0);
             pending.open(key());
             require(Json::parse(pending.transactions(0, 10)).empty(), "Uninitialized restore leaked history");
             require(!pending.initialTransactionsLoaded_, "Pending restore marked history loaded");
         }
         auto emptyPath = directory + "/empty";
         seed(emptyPath, -1, true, false);
-        Session empty(1, emptyPath);
+        Session empty(1, emptyPath, false, 0);
         empty.open(key());
         require(Json::parse(empty.transactions(0, 10)).empty(), "Empty wallet leaked history");
 
         auto path = directory + "/completed";
         seed(path, -1, true, true);
         for (int i = 0; i < 2; ++i) {
-            Session session(1, path);
+            Session session(1, path, false, 0);
             session.open(key());
             auto rows = Json::parse(session.transactions(0, 10));
             require(rows.size() == 2, "Reopen lost history or exposed non-BEAM asset");
@@ -173,7 +173,7 @@ public:
             require(Json::parse(session.transactions(0, 10)).empty(), "Empty Reset retained history");
         }
         for (bool wrongNetwork : {false, true}) {
-            Session rejected(wrongNetwork ? 0 : 1, path);
+            Session rejected(wrongNetwork ? 0 : 1, path, false, 0);
             bool failed = false;
             try {
                 rejected.open(wrongNetwork ? key() : std::vector<std::uint8_t>(32, 0x42));

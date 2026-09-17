@@ -38,13 +38,14 @@ class SnapshotRestoreIntentNativeTest {
                 restoreType = 2,
                 restoreValue = intent,
                 logLevel = 0,
+                requireRecoveryQuorum = false,
             )
             assertNotEquals(0L, handle)
             assertEquals(expectedPersistedIntent, Json.parseToJsonElement(BeamNative.snapshotRestoreIntent(handle)))
             BeamNative.close(handle)
             handle = 0L
 
-            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0)
+            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0, requireRecoveryQuorum = false)
             assertNotEquals(0L, handle)
             assertEquals(expectedPersistedIntent, Json.parseToJsonElement(BeamNative.snapshotRestoreIntent(handle)))
         } finally {

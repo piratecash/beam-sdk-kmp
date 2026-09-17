@@ -11,6 +11,7 @@
 #include "wallet/core/wallet.h"
 #include "wallet/core/wallet_db.h"
 #include "wallet/transactions/lelantus/push_transaction.h"
+#include "utility/log_rotation.h"
 
 #include "3rdparty/nlohmann/json.hpp"
 
@@ -300,16 +301,90 @@ private:
     std::string& value_;
 };
 
-void ensureLogger() {
-    // WalletClient always creates a LogRotation object. Beam Core requires a logger
-    // singleton even when the embedding application requested no logs. Keep both
-    // sinks disabled here; the KMP layer owns user-visible/redacted logging.
-    static auto logger = beam::Logger::create(
-        BEAM_LOG_LEVEL_WARNING,
-        BEAM_LOG_LEVEL_CRITICAL,
-        BEAM_LOG_SINK_DISABLED
-    );
-    (void) logger;
+// Above BEAM_LOG_LEVEL_CRITICAL, so the console sink accepts nothing: level_accepted is
+// `level >= minLevel` and nothing is ever logged above CRITICAL. A genuinely disabled console
+// cannot be used, because Logger::create computes its sink selector from `consoleLevel > 0` and
+// `fileLevel > 0` and throws "no logger sink configured" when both are zero — and a null logger
+// is not an option either, since Logger::get asserts on it and LogRotation calls it on every tick.
+std::filesystem::path utf8Path(const std::string& value);
+
+constexpr int BEAM_SDK_SILENT_CONSOLE = BEAM_LOG_LEVEL_CRITICAL + 1;
+// LogRotation's own cleanup only ever schedules the file current at each tick, and those pending
+// deletions die with the session. A directory scan at startup is what actually bounds retention.
+constexpr unsigned BEAM_SDK_LOG_CLEANUP_SEC = 5 * 24 * 3600;
+constexpr const char* BEAM_SDK_LOG_PREFIX = "beam_";
+
+struct LoggerLevels {
+    int flush;
+    int console;
+    int file;
+};
+
+// Mirrors BeamLogLevel: None=0, Error=1, Info=2, Debug=3. The console stays silent at every
+// level: on Android stdout reaches logcat, and the setting asks for a file sink, not logcat.
+// flushLevel equals fileLevel on purpose. LoggerImpl only flushes when `level >= flushLevel`, so
+// a higher flush threshold leaves accepted lines sitting in the stdio buffer until an error
+// happens to arrive. The reason this setting exists is diagnosing a silent stall, which produces
+// no error at all — the log would then be empty exactly when it is needed.
+LoggerLevels loggerLevelsFor(int logLevel) {
+    switch (logLevel) {
+        case 1: return {BEAM_LOG_LEVEL_ERROR, BEAM_SDK_SILENT_CONSOLE, BEAM_LOG_LEVEL_ERROR};
+        case 2: return {BEAM_LOG_LEVEL_INFO, BEAM_SDK_SILENT_CONSOLE, BEAM_LOG_LEVEL_INFO};
+        case 3: return {BEAM_LOG_LEVEL_DEBUG, BEAM_SDK_SILENT_CONSOLE, BEAM_LOG_LEVEL_DEBUG};
+        default: return {BEAM_LOG_LEVEL_CRITICAL, BEAM_SDK_SILENT_CONSOLE, BEAM_LOG_SINK_DISABLED};
+    }
+}
+
+// First open in a process wins. beam::Logger is a process-global singleton whose create() throws
+// while one exists and whose storage is only released by the destructor, so honouring a second,
+// different level would mean tearing down a logger another session may be writing through. The
+// warning below is best-effort: at None nothing has a sink that accepts it, and at Error it is
+// filtered by the file sink's own minimum.
+void ensureLogger(int logLevel, const std::string& storagePath) {
+    static std::mutex loggerMutex;
+    static std::shared_ptr<beam::Logger> logger;
+    static int loggerLevel = -1;
+
+    std::lock_guard<std::mutex> lock(loggerMutex);
+    if (logger) {
+        if (loggerLevel != logLevel) {
+            BEAM_LOG_WARNING() << "Beam core logging is process-wide and was already configured at level "
+                << loggerLevel << "; ignoring the requested level " << logLevel;
+        }
+        return;
+    }
+
+    auto levels = loggerLevelsFor(logLevel);
+    std::string logDirectory;
+    if (levels.file > BEAM_LOG_SINK_DISABLED) {
+        try {
+            auto directory = utf8Path(storagePath) / "logs";
+            std::filesystem::create_directories(directory);
+            logDirectory = directory.string();
+            beam::clean_old_logfiles(logDirectory, BEAM_SDK_LOG_PREFIX, BEAM_SDK_LOG_CLEANUP_SEC);
+        } catch (...) {
+            // An unwritable log directory never fails open(). Fall back to the silent
+            // configuration rather than to two disabled sinks, which create() rejects.
+            levels = loggerLevelsFor(0);
+            logDirectory.clear();
+        }
+    }
+
+    try {
+        logger = beam::Logger::create(
+            levels.flush, levels.console, levels.file, BEAM_SDK_LOG_PREFIX, logDirectory);
+    } catch (...) {
+        // create() opens the first log file itself, and FileLogger's constructor throws when that
+        // fopen fails - a logs/ directory that already exists but is not writable, a read-only
+        // volume, a full partition. create_directories above cannot see any of those. Without
+        // this the exception would leave ensureLogger, leave the Session constructor, and fail
+        // open()/create() outright: the wallet would refuse to start because of its logs.
+        levels = loggerLevelsFor(0);
+        logDirectory.clear();
+        logger = beam::Logger::create(
+            levels.flush, levels.console, levels.file, BEAM_SDK_LOG_PREFIX, logDirectory);
+    }
+    loggerLevel = logLevel;
 }
 
 std::filesystem::path utf8Path(const std::string& value) {
@@ -623,12 +698,13 @@ Timestamp parseUtcDate(const std::string& value) {
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(int network, std::string storagePath)
+    Session(int network, std::string storagePath, bool requireRecoveryQuorum, int logLevel)
         : network_(network),
           storagePath_(std::move(storagePath)),
+          requireRecoveryQuorum_(requireRecoveryQuorum),
           reactor_(beam::io::Reactor::create()) {
         if (network_ != 0 && network_ != 1) throw std::invalid_argument("Unknown Beam network");
-        ensureLogger();
+        ensureLogger(logLevel, storagePath_);
         rules_.m_Network = network_ == 0 ? Rules::Network::mainnet : Rules::Network::testnet;
         rules_.UpdateChecksum();
     }
@@ -890,7 +966,10 @@ public:
                     if (!network || !wallet) {
                         throw std::runtime_error("Beam recovery quorum could not be initialized");
                     }
-                    network->SetRecoveryQuorum(true);
+                    // One member drives both halves. The setter pushes to the transport and
+                    // installs the park reporter, which is why it is correct here even though
+                    // WalletClient::start already ran ConfigureRecoveryQuorum.
+                    wallet->SetRecoveryQuorumRequired(self->requireRecoveryQuorum_);
                     std::weak_ptr<beam::sdk::OfflineContext> context = self->offlineContext_;
                     std::weak_ptr<Wallet> contextWallet = wallet;
                     std::weak_ptr<beam::proto::FlyClient::NetworkStd> contextNetwork = network;
@@ -2319,6 +2398,9 @@ private:
 
     int network_;
     std::string storagePath_;
+    // Off by default, matching the official wallet: a recovery body pack is accepted from one
+    // node. Turning this on restores the two-responder requirement.
+    bool requireRecoveryQuorum_ = false;
     Rules rules_;
     beam::io::Reactor::Ptr reactor_;
     IWalletDB::Ptr database_;
@@ -2653,7 +2735,8 @@ Java_cash_p_beam_internal_BeamNative_create(
     jint network,
     jint restoreType,
     jstring restoreValue,
-    jint
+    jint logLevel,
+    jboolean requireRecoveryQuorum
 ) {
     return jniCall(environment, [&]() -> jlong {
         std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
@@ -2661,7 +2744,8 @@ Java_cash_p_beam_internal_BeamNative_create(
         ByteWiper seedWiper(seedBytes);
         auto keyBytes = javaBytes(environment, databaseKey);
         ByteWiper keyWiper(keyBytes);
-        auto session = std::make_shared<Session>(network, javaString(environment, storagePath));
+        auto session = std::make_shared<Session>(
+            network, javaString(environment, storagePath), requireRecoveryQuorum == JNI_TRUE, logLevel);
         auto handle = registerSession(session);
         try {
             session->create(
@@ -2690,13 +2774,15 @@ Java_cash_p_beam_internal_BeamNative_open(
     jstring storagePath,
     jbyteArray databaseKey,
     jint network,
-    jint
+    jint logLevel,
+    jboolean requireRecoveryQuorum
 ) {
     return jniCall(environment, [&]() -> jlong {
         std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
         auto keyBytes = javaBytes(environment, databaseKey);
         ByteWiper keyWiper(keyBytes);
-        auto session = std::make_shared<Session>(network, javaString(environment, storagePath));
+        auto session = std::make_shared<Session>(
+            network, javaString(environment, storagePath), requireRecoveryQuorum == JNI_TRUE, logLevel);
         auto handle = registerSession(session);
         try {
             session->open(keyBytes);

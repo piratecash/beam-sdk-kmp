@@ -288,6 +288,55 @@ public:
     static void queued(Wallet& w, const BaseTransaction::Ptr& tx) { w.UpdateOnSynced(tx); }
     static void update(Wallet& w, const BaseTransaction::Ptr& tx) { w.UpdateActiveTransaction(tx); }
     static RecognitionRecovery state(const Wallet& w) { return w.m_RecognitionRecovery; }
+    // Built here because the request types are private to Wallet and only this struct is a friend.
+    // An empty pack is exactly what DataMissing and an empty HdrPack deliver.
+    static void completeEmptyHdrs(Wallet& w)
+    {
+        Wallet::MyRequestEnumHdrs::Ptr r(new Wallet::MyRequestEnumHdrs);
+        r->m_Msg.m_Height.m_Min = 1; // m_vStates deliberately left empty
+        w.OnRequestComplete(*r);
+    }
+    static void completeEmptyBodyPack(Wallet& w)
+    {
+        Wallet::MyRequestBodyPack::Ptr r(new Wallet::MyRequestBodyPack);
+        // A recovery wallet evaluates a guard before the validation, and RequestBodies always
+        // posts the pack that continues the cursor. Leaving m_StartHeight at 0 would make the
+        // guard drop the response and the case would assert against a shape production never
+        // produces - which is precisely what it did while the fixture DB had no recovery policy.
+        r->m_StartHeight = w.GetEventsHeightNext();
+        w.OnRequestComplete(*r);
+    }
+    // Calls the validator directly. Driving a VALID pack through OnRequestComplete would continue
+    // into real body processing and need genuine block bodies; the reset under test lives in the
+    // validator itself, so the unit is exactly what should be exercised.
+    static bool validateBodyPack(Wallet& w, unsigned bodies)
+    {
+        Wallet::MyRequestBodyPack::Ptr r(new Wallet::MyRequestBodyPack);
+        r->m_StartHeight = w.GetEventsHeightNext();
+        r->m_Res.m_Bodies.resize(bodies);
+        return w.ValidateBodyPackResponse(*r);
+    }
+    static unsigned bodyPackRetries(const Wallet& w) { return w.m_BodyPackQuorumRetries; }
+    // Posts a retry and reports the exclusion the wallet asked the transport to honour. The
+    // pending slot is freed afterwards: a body pack compares equal to every other one, so only a
+    // single request may be outstanding and a second PostReqUnique would be dropped silently.
+    static io::Address repeatBodyPackExclusion(
+        Wallet& w, proto::FlyClient::NetworkStd& network, const io::Address& responder)
+    {
+        const auto before = network.m_lst.size();
+        Wallet::MyRequestBodyPack::Ptr r(new Wallet::MyRequestBodyPack);
+        r->m_StartHeight = w.GetEventsHeightNext();
+        r->m_RecoveryResponder = responder;
+        w.RepeatBodyPackRequest(*r);
+        require(network.m_lst.size() == before + 1, "the retry was not posted at all");
+        auto& posted = Cast::Up<Wallet::MyRequestBodyPack>(*network.m_lst.back().m_pRequest);
+        const auto excluded = posted.m_RecoveryExcludedAddress;
+        w.DeleteReq(posted);
+        network.m_lst.Clear();
+        return excluded;
+    }
+    static bool quorumRequired(const Wallet& w) { return w.m_RecoveryQuorumRequired; }
+    static bool quorumConfigured(const Wallet& w) { return w.m_RecoveryQuorumConfigured; }
     static auto listCallback(proto::FlyClient::Request& r)
     { return static_cast<Wallet::MyRequestShieldedList&>(r).m_callback; }
     static void markBeforeHistory(Wallet& w, Height firstRemoved) { w.OnRollingBack(firstRemoved); }
@@ -345,6 +394,42 @@ void drain(TestNetwork& network, NodeProcessor& node, bool duplicatePeer = false
     }
 }
 
+// The acceptance path of the SHIPPED default: the quorum is off and the node pool answers with
+// a single responder, which is exactly the Pixel's situation. Nothing in the wallet may wait for
+// a second opinion there. CheckBodyPackQuorum cannot resolve when the candidate peer equals the
+// responder - neither comparison branch is taken, so it falls through to RepeatBodyPackRequest
+// and returns false with no counter touched and no failure reported. A comparison reached with
+// the switch off therefore re-requests forever: the original stall, shipped, with a green gate.
+// Hence the drain here runs with duplicatePeer, the mirror of the armed phase that pins the
+// cursor at 0 under the same single responder.
+void unarmedSingleResponderDrain(std::shared_ptr<WalletDB> db, NodeProcessor& node, const std::string& snapshotPath,
+    const Block::SystemState::Full& imported, const Block::SystemState::Full& forkPoint,
+    const Block::SystemState::Full& tip)
+{
+    auto wallet = std::make_shared<Wallet>(db);
+    db->ImportRecovery(snapshotPath, *wallet);
+    wallet->RecordSnapshotImport(imported);
+    const Height start = imported.get_Height() + 1;
+    wallet->StartBodyRequestsAt(start, db->get_ShieldedOuts(), start, true);
+    storage::setVar(*db, "beam.sdk.kmp.restore.initialized.v1", true);
+    db->FlushNow();
+    Access::fork(*wallet, forkPoint);
+    auto network = std::make_shared<TestNetwork>(*wallet);
+    wallet->SetNodeEndpoint(network);
+    // No SetRecoveryQuorumRequired call at all: the default is what ships, and asserting it
+    // through an explicit setter would pass even if the default flipped back to armed.
+    wallet->ConfigureRecoveryQuorum();
+    wallet->EnableBodyRequests(true);
+    const Height before = storage::getNextEventHeight(*db);
+    Access::tip(*wallet, tip);
+    drain(*network, node, true);
+    require(storage::getNextEventHeight(*db) > before,
+        "one responder never advanced the cursor with the quorum off");
+    require(wallet->IsRecoveryAdmissionOpen(),
+        "one responder never reached Ready with the quorum off");
+    std::cout << "SNAPSHOT_REORG_SOLO_RESPONDER_OK" << std::endl;
+}
+
 struct ProbeTx : BaseTransaction
 {
     unsigned updates = 0;
@@ -376,6 +461,102 @@ struct Signer : ProbeBuilder::KeyKeeperHandler
         Detach(builder, BaseTxBuilder::Stage::Done);
     }
 };
+
+// The switch is off here, which is the shipped default. Everything asserted below therefore
+// describes what every wallet does unless a caller opts back in.
+void recoveryValidationWithQuorumOff(WalletDB::Ptr db, WalletDB::Ptr orderDb, WalletDB::Ptr soloDb)
+{
+    using Network = proto::FlyClient::NetworkStd;
+    Wallet wallet(db);
+    auto network = std::make_shared<Network>(wallet);
+    wallet.SetNodeEndpoint(network);
+    wallet.SetRecoveryQuorumRequired(false);
+    wallet.ConfigureRecoveryQuorum();
+
+    require(!Access::quorumRequired(wallet), "the switch did not stay off");
+    // R3: one member drives both halves, so the transport must agree with the wallet.
+    require(!network->m_RequireRecoveryQuorum, "transport armed although the switch is off");
+    // R6: an armed-capable transport always carries a reporter, or a park is a silent hang.
+    require(bool(network->m_RecoveryParkReport), "no park reporter was installed");
+    // R4: this is a different flag and must stay true, or AllowRequest blocks every recovery
+    // request and FinishRecognitionRecovery never completes.
+    require(Access::quorumConfigured(wallet), "the configured flag was tied to the switch");
+
+    unsigned failures = 0;
+    wallet.SetBodyQuorumFailureHandler([&](const std::string&) { ++failures; });
+
+    // R5, the case that would be undefined behaviour if validation were gated with the
+    // comparison: OnRequestComplete(MyRequestEnumHdrs&) dereferences m_vStates.front(), and the
+    // transport does deliver empty header packs (DataMissing, and an empty HdrPack that
+    // DecodeAndCheck accepts). Three attempts must be bounded, not looped.
+    for (unsigned attempt = 0; attempt < 3; ++attempt) Access::completeEmptyHdrs(wallet);
+    require(failures == 1, "empty header packs were not bounded with the quorum off");
+
+    // The same for an empty body pack, which is the only protection against a zero-progress loop.
+    for (unsigned attempt = 0; attempt < 3; ++attempt) Access::completeEmptyBodyPack(wallet);
+    require(failures == 2, "empty body packs were not bounded with the quorum off");
+
+    // The bound must count CONSECUTIVE failures. Three empty packs in a row are bounded above,
+    // but a scan that runs for hours also sees empty packs SEPARATED by good ones - DataMissing
+    // routes into the same handler - and those must not accumulate into a terminal
+    // BeamFailure.Quorum. Two empties, then a valid pack, must leave the counter at zero.
+    Access::validateBodyPack(wallet, 0);
+    Access::validateBodyPack(wallet, 0);
+    require(Access::bodyPackRetries(wallet) == 2, "an empty pack did not count against the bound");
+    require(Access::validateBodyPack(wallet, 1), "a non-empty pack was rejected by the validator");
+    require(Access::bodyPackRetries(wallet) == 0,
+        "a valid pack did not clear the retry bound, so scattered empty packs accumulate into a "
+        "terminal failure");
+
+    // The production order, which the block above does NOT exercise: WalletClient::start runs
+    // ConfigureRecoveryQuorum on its own thread before the JNI call site ever reaches the wallet,
+    // so the switch is always flipped AFTER the transport has already been configured once.
+    // Unless the setter itself pushes to the endpoint, the arming silently does nothing.
+    {
+        Wallet ordered(orderDb);
+        auto orderedNetwork = std::make_shared<Network>(ordered);
+        ordered.SetNodeEndpoint(orderedNetwork);
+        ordered.ConfigureRecoveryQuorum();
+        require(!orderedNetwork->m_RequireRecoveryQuorum, "the default configuration armed the transport");
+        ordered.SetRecoveryQuorumRequired(true);
+        require(orderedNetwork->m_RequireRecoveryQuorum, "arming after ConfigureRecoveryQuorum did not reach the transport");
+        ordered.SetRecoveryQuorumRequired(false);
+        require(!orderedNetwork->m_RequireRecoveryQuorum, "disarming after ConfigureRecoveryQuorum did not reach the transport");
+
+    }
+
+    // A wallet that never runs ConfigureRecoveryQuorum at all - an Existing wallet has no recovery
+    // policy - must still get a reporter from the setter, or an armed transport parks in silence.
+    // Asserting the std::function is non-empty is not enough: it must actually reach the handler.
+    {
+        Wallet solo(soloDb);
+        auto soloNetwork = std::make_shared<Network>(solo);
+        solo.SetNodeEndpoint(soloNetwork);
+        unsigned parkReports = 0;
+        solo.SetBodyQuorumFailureHandler([&](const std::string&) { ++parkReports; });
+        solo.SetRecoveryQuorumRequired(true);
+        require(soloNetwork->m_RequireRecoveryQuorum, "the setter alone did not arm the transport");
+        require(bool(soloNetwork->m_RecoveryParkReport), "the setter alone installed no park reporter");
+        soloNetwork->m_RecoveryParkReport("park");
+        require(parkReports == 1, "the park reporter does not reach the failure handler");
+
+        // A retry may only avoid the previous responder when a second opinion is actually wanted.
+        // The transport honours an exclusion whatever the policy says, so with the quorum off and
+        // one qualifying peer an excluded retry is parked forever: no callback, the pending set
+        // never clears, RequestBodies early-returns on m_WaitingRecoveryCursor and the scan stops
+        // with no error at all - the original silent deadlock, reached by another route.
+        // Checked here rather than on a recovery wallet because AllowRequest refuses to post a
+        // body pack until recovery admission opens, and the exclusion is decided before that.
+        const auto responder = io::Address::localhost().port(1);
+        require(Access::repeatBodyPackExclusion(solo, *soloNetwork, responder) == responder,
+            "an armed retry did not ask for a different peer");
+        solo.SetRecoveryQuorumRequired(false);
+        require(Access::repeatBodyPackExclusion(solo, *soloNetwork, responder) == io::Address(),
+            "a retry excluded the only peer while the quorum was off, which parks it forever");
+    }
+
+    std::cout << "SNAPSHOT_REORG_QUORUM_OFF_VALIDATION_OK" << std::endl;
+}
 
 void kernelResponseAdmission(WalletDB::Ptr db, NodeProcessor& node, const Merkle::Hash& kernelId)
 {
@@ -596,6 +777,14 @@ void runFixture()
         if (h == 60) kernelId = tx->m_vKernels.front()->get_ID();
         headers.push_back(mine(node, master, tx));
     }
+    // sdk=true on the first two: it is what sets beam.sdk.kmp.restore.v1 and therefore
+    // m_RecoveryPolicy, and OnRequestComplete(MyRequestBodyPack&) evaluates a guard in front of
+    // the validation only when that policy is on. With sdk=false the empty-pack assertion would
+    // run on a wallet shape no shipped recovery wallet ever has. The third stays false on
+    // purpose: it models an "Existing" wallet, which has no recovery policy and never runs
+    // ConfigureRecoveryQuorum.
+    recoveryValidationWithQuorumOff(create("quorum-off.db", true),
+        create("quorum-order.db", true), create("quorum-solo.db", false));
     kernelResponseAdmission(create("kernel.db", false), node, kernelId);
     assetsResponseAdmission(create("assets.db", false), node.m_Cursor.m_Full);
     require(outputCount(wireBody(node, 10, S - 20, S)) == 0, "compact horizon did not omit V");
@@ -638,9 +827,13 @@ void runFixture()
     require(!wallet->IsRecoveryAdmissionOpen(), "rollback gate open");
     const auto raw = parameters(*db);
     auto replacement = mine(node, master);
+    unarmedSingleResponderDrain(create("quorum-off-drain.db", true), node,
+        (dir / "snapshot.bin").string(), headers.back(), headers[F - 1], replacement);
     auto network = std::make_shared<TestNetwork>(*wallet);
     wallet->SetNodeEndpoint(network);
-    wallet->ConfigureRecoveryQuorum();
+    // The quorum is off by default now, matching the official wallet. These cases assert quorum
+    // behaviour, so they arm it explicitly rather than inheriting it.
+    wallet->SetRecoveryQuorumRequired(true); wallet->ConfigureRecoveryQuorum();
     wallet->EnableBodyRequests(true);
     Access::tip(*wallet, replacement);
     drain(*network, node, true, 4);
@@ -657,7 +850,7 @@ void runFixture()
     require(storage::getNextEventHeight(*db) == cursor && Access::state(*wallet).m_Generation == generation,
         "reopen lost committed recovery progress");
     network = std::make_shared<TestNetwork>(*wallet);
-    wallet->SetNodeEndpoint(network); wallet->ConfigureRecoveryQuorum(); wallet->EnableBodyRequests(true);
+    wallet->SetNodeEndpoint(network); wallet->SetRecoveryQuorumRequired(true); wallet->ConfigureRecoveryQuorum(); wallet->EnableBodyRequests(true);
     Access::tip(*wallet, replacement);
     drain(*network, node);
     require(wallet->IsRecoveryAdmissionOpen(), "recovery never reached Ready");
@@ -839,7 +1032,7 @@ void runFixture()
         storage::setVar(*crashDb, "beam.sdk.kmp.restore.initialized.v1", true);
         crashDb->FlushNow();
         auto transport = std::make_shared<TestNetwork>(*engine);
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
         bool injected = false;
         Height committedCursor = 0;
         Wallet::SetRecoveryCheckpointForTests([&](const char* currentPoint) {
@@ -875,7 +1068,7 @@ void runFixture()
         if (committedCursor) require(storage::getNextEventHeight(*crashDb) == committedCursor,
             "post-commit exception rolled back durable progress");
         transport = std::make_shared<TestNetwork>(*engine);
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->ResumeAllTransactions();
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->ResumeAllTransactions();
         engine->EnableBodyRequests(true);
         if (point == "before-marker") Access::fork(*engine, headers[F - 1]);
         Access::tip(*engine, replacement);
@@ -911,7 +1104,7 @@ void runFixture()
         brokenDb->Subscribe(&observer);
         auto transport = std::make_shared<TestNetwork>(*engine);
         transport->adversary = adversary;
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
         Access::tip(*engine, replacement); drain(*transport, node);
         require(!engine->IsRecoveryAdmissionOpen() && !brokenDb->IsSelectionAllowed(), "adversarial body opened gate");
         Coin coin; coin.m_ID = U;
@@ -933,7 +1126,7 @@ void runFixture()
         require(Access::state(*engine).m_OriginalBirthday == 100 &&
             engine->BodyRecognitionBoundaryForTests() == 51, "height/date original or effective boundary changed incorrectly");
         auto transport = std::make_shared<TestNetwork>(*engine);
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
         Access::tip(*engine, replacement); drain(*transport, node);
         require(engine->IsRecoveryAdmissionOpen() && birthdayDb->get_ShieldedOuts() == 1, "height/date replay/count incomplete");
         Coin beforeBoundary; beforeBoundary.m_ID = U;
@@ -952,7 +1145,7 @@ void runFixture()
     sendEngine->StartBodyRequestsAt(S + 1, sendDb->get_ShieldedOuts(), S + 1, true);
     Access::fork(*sendEngine, headers[F - 1]);
     auto sendNetwork = std::make_shared<TestNetwork>(*sendEngine);
-    sendEngine->SetNodeEndpoint(sendNetwork); sendEngine->ConfigureRecoveryQuorum(); sendEngine->EnableBodyRequests(true);
+    sendEngine->SetNodeEndpoint(sendNetwork); sendEngine->SetRecoveryQuorumRequired(true); sendEngine->ConfigureRecoveryQuorum(); sendEngine->EnableBodyRequests(true);
     Access::tip(*sendEngine, replacement); drain(*sendNetwork, node);
     sendEngine->RegisterTransactionType(TxType::PushTransaction,
         std::make_shared<lelantus::PushTransaction::Creator>([sendDb] { return sendDb; }));
@@ -1005,7 +1198,7 @@ void runFixture()
         engine->StartBodyRequestsAt(S + 1, entryDb->get_ShieldedOuts(), S + 1, true);
         Access::fork(*engine, headers[F - 1]);
         auto transport = std::make_shared<TestNetwork>(*engine);
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->EnableBodyRequests(true);
         Access::tip(*engine, node.m_Cursor.m_Full); drain(*transport, node);
         require(engine->IsRecoveryAdmissionOpen(), "initial-flush fixture never opened admission");
         auto pending = std::make_shared<ProbeTx>(BaseTransaction::TxContext(*engine, *engine, GenerateTxID()));
@@ -1034,7 +1227,7 @@ void runFixture()
         engine = std::make_shared<Wallet>(entryDb);
         require(!engine->IsRecoveryAdmissionOpen(), "initial-flush reopen admitted before validation");
         transport = std::make_shared<TestNetwork>(*engine);
-        engine->SetNodeEndpoint(transport); engine->ConfigureRecoveryQuorum(); engine->ResumeAllTransactions();
+        engine->SetNodeEndpoint(transport); engine->SetRecoveryQuorumRequired(true); engine->ConfigureRecoveryQuorum(); engine->ResumeAllTransactions();
         engine->EnableBodyRequests(true); Access::tip(*engine, node.m_Cursor.m_Full); drain(*transport, node);
         require(engine->IsRecoveryAdmissionOpen() && storage::getNextEventHeight(*entryDb) == cursorBefore,
             "initial-flush failure did not remain reopen-recoverable");

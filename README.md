@@ -13,8 +13,8 @@ recovery, lifecycle, and release contract is summarized below.
 
 - encrypted Beam Core `WalletDB` as the only wallet ledger;
 - create/open/height/date/full/snapshot restore flows;
-- official mainnet/testnet pools with two-distinct-connection agreement before recovery bodies are
-  committed;
+- official mainnet/testnet pools, with optional two-distinct-connection agreement before recovery
+  bodies are committed (`BeamSdkConfig.requireRecoveryQuorum`, off by default);
 - bounded reversible shielded-output count checkpoints for reorgs, with safe full-count fallback
   for a fork deeper than retained history;
 - one-sided receive tokens, balance/history, fee preview and durable
@@ -35,9 +35,12 @@ fallback still transfers historical body data. A mainnet measurement for a walle
 than one day earlier received 1.74 GB by approximately 7.5% progress, so height/date recovery is
 not recommended for normal end-user UX with the current checkpoint strategy. Prefer
 `SnapshotThenScan`, show the server-reported size before download, and retain height/date only as
-advanced or diagnostic recovery options. Recovery body data is accepted only after matching
-responses through two different live node connections at the verified tip; there is no single-node
-fallback or public custom-node option. New-wallet creation persists its creation timestamp in the
+advanced or diagnostic recovery options. Recovery body data is accepted from a single node
+connection by default, matching the official Beam wallet. Setting
+`BeamSdkConfig.requireRecoveryQuorum` requires matching responses through two different live node
+connections at the verified tip instead; a wallet that cannot reach two such nodes then reports
+`BeamFailure.Quorum` rather than completing its scan. There is no public custom-node option in
+either mode. New-wallet creation persists its creation timestamp in the
 same encrypted DB transaction before any receive token can be issued. Initial sync resolves that
 timestamp against authenticated historical headers and subtracts the same 1,440-block safety
 window, so a payment made to an early token while headers are still syncing is not skipped.
@@ -61,7 +64,10 @@ is responsible for wrapping the DB key with Android Keystore.
 
 The SDK logs lifecycle transitions, sync phases and failures through Kermit under the `BeamSDK`
 tag, without logging seeds, database keys or payment tokens. The embedding application owns the
-global Kermit writers and severity policy. Both sample hosts install `platformLogWriter()` at Debug
+global Kermit writers and severity policy. Beam core's own log is separate and off by default:
+`BeamSdkConfig.logLevel` above `BeamLogLevel.None` makes the core write a rotating file under
+`$storagePath/logs` that contains addresses, amounts and heights, so it is a deliberate
+diagnostic choice rather than a verbosity knob. Both sample hosts install `platformLogWriter()` at Debug
 severity so their runs are diagnosable without additional setup. An embedding application that
 already configures Kermit must not install a second writer for this SDK.
 

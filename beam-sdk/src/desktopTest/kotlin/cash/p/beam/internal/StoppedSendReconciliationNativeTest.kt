@@ -30,7 +30,7 @@ class StoppedSendReconciliationNativeTest {
         val seed = ByteArray(64) { (0x61 + it).toByte() }
         var handle = 0L
         try {
-            handle = BeamNative.create(directory.toString(), key, seed, 1, -1, "", 0)
+            handle = BeamNative.create(directory.toString(), key, seed, 1, -1, "", 0, false)
             val transactionId = seedPreparedSend(handle)
             BeamNative.close(handle)
             handle = 0L
@@ -85,13 +85,14 @@ class StoppedSendReconciliationNativeTest {
                 restoreType = -1,
                 restoreValue = "",
                 logLevel = 0,
+                requireRecoveryQuorum = false,
             )
             seedInterruptedBootstrap(handle)
             assertTrue(BeamNative.bodyRequestsPendingForTests(handle))
             BeamNative.close(handle)
             handle = 0L
 
-            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0)
+            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0, requireRecoveryQuorum = false)
             assertFalse(
                 BeamNative.bodyRequestsPendingForTests(handle),
                 "An unfinished wallet must sync headers before installing its birthday body cursor",
@@ -126,13 +127,14 @@ class StoppedSendReconciliationNativeTest {
                 restoreType = -1,
                 restoreValue = "",
                 logLevel = 0,
+                requireRecoveryQuorum = false,
             )
             assertNotEquals(0L, handle)
             val transactionId = seedPreparedSend(handle)
             BeamNative.close(handle)
             handle = 0L
 
-            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0)
+            handle = BeamNative.open(directory.toString(), key, network = 1, logLevel = 0, requireRecoveryQuorum = false)
             assertResolution("Prepared", transactionId, BeamNative.resolveSend(handle, OPERATION_ID))
             assertTrue(BeamNative.abortPrepared(handle, OPERATION_ID))
             assertResolution("NotPrepared", null, BeamNative.resolveSend(handle, OPERATION_ID))
