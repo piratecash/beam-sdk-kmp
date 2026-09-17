@@ -57,6 +57,8 @@ internal data class BackendSnapshot(
     val transactions: List<BeamTransaction> = emptyList(),
     val restoreCurrent: Long? = null,
     val restoreTarget: Long? = null,
+    val syncDone: Long? = null,
+    val syncTotal: Long? = null,
     val restoreBytes: Long? = null,
     val restoreTotalBytes: Long? = null,
     val failureMessage: String? = null,

@@ -56,7 +56,17 @@ public sealed interface BeamWalletState {
     public data object Stopped : BeamWalletState
     public data object Connecting : BeamWalletState
     public data class Restoring(val progress: BeamRestoreProgress) : BeamWalletState
-    public data class Syncing(val currentHeight: Long, val targetHeight: Long) : BeamWalletState
+    /**
+     * [syncDone] and [syncTotal] count scanned blocks and are the only honest progress signal:
+     * the height pair moves with the chain tip, so it can stay flat or grow while work happens.
+     * Both are null on a native library that does not report them.
+     */
+    public data class Syncing(
+        val currentHeight: Long,
+        val targetHeight: Long,
+        val syncDone: Long? = null,
+        val syncTotal: Long? = null,
+    ) : BeamWalletState
     public data class Ready(val height: Long) : BeamWalletState
     public data class Offline(val lastKnownHeight: Long?) : BeamWalletState
     public data class Error(val failure: BeamFailure) : BeamWalletState
@@ -93,7 +103,21 @@ public data class BeamBalance(
     val maturing: Long = 0,
     val shielded: Long = 0,
     val isAuthoritative: Boolean = false,
-)
+    /**
+     * The wallet database reported these amounts at least once since the session started.
+     * Prefer [isLoaded], which also covers an authoritative balance.
+     */
+    val loadedFromDatabase: Boolean = false,
+) {
+    /**
+     * The amounts are real, though possibly behind the chain: safe to display, not to spend from.
+     *
+     * Derived rather than stored so that `isAuthoritative` always implies it. A caller cannot
+     * construct a fully synced balance that claims to carry no data, and a native library that
+     * predates [loadedFromDatabase] still reports a loaded balance once it reaches a synced state.
+     */
+    val isLoaded: Boolean get() = loadedFromDatabase || isAuthoritative
+}
 
 public enum class BeamAddressType {
     Offline,

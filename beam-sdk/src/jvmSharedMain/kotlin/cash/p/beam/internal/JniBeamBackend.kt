@@ -63,6 +63,7 @@ private class JniBeamBackend : BeamBackend {
     private var lastLoggedTargetHeight: Long? = null
     private var lastLoggedSyncDone: Long? = null
     private var lastLoggedSyncTotal: Long? = null
+    private var lastLoggedQuorumRequests: Long? = null
 
     override val snapshot: StateFlow<BackendSnapshot> = mutableSnapshot
 
@@ -333,16 +334,19 @@ private class JniBeamBackend : BeamBackend {
                     lastLoggedCurrentHeight != dto.currentHeight ||
                     lastLoggedTargetHeight != dto.targetHeight ||
                     lastLoggedSyncDone != dto.syncDone ||
-                    lastLoggedSyncTotal != dto.syncTotal
+                    lastLoggedSyncTotal != dto.syncTotal ||
+                    lastLoggedQuorumRequests != dto.quorumRequests
                 ) {
                     lastLoggedPhase = dto.phase
                     lastLoggedCurrentHeight = dto.currentHeight
                     lastLoggedTargetHeight = dto.targetHeight
                     lastLoggedSyncDone = dto.syncDone
                     lastLoggedSyncTotal = dto.syncTotal
+                    lastLoggedQuorumRequests = dto.quorumRequests
                     logger.d {
                         "state phase=${dto.phase} current=${dto.currentHeight} target=${dto.targetHeight}" +
-                            " syncDone=${dto.syncDone ?: "n/a"} syncTotal=${dto.syncTotal ?: "n/a"}"
+                            " syncDone=${dto.syncDone ?: "n/a"} syncTotal=${dto.syncTotal ?: "n/a"}" +
+                            " quorumRequests=${dto.quorumRequests}"
                     }
                 }
                 if (snapshotRestoreState.downloadedFile != null && dto.phase in SNAPSHOT_SUCCESS_NATIVE_PHASES) {
@@ -554,18 +558,27 @@ private data class SnapshotRestoreIntentDto(
     )
 }
 
+// Internal rather than private so the decode contract can be tested directly: the strict Json
+// config below turns an unexpected payload shape into a permanent error phase, so the defaults
+// that absorb an older native library are worth asserting.
 @Serializable
-private data class SnapshotDto(
+internal data class SnapshotDto(
     val phase: String,
     val offlineSigning: OfflineSigningDto = OfflineSigningDto(),
     val currentHeight: Long = 0,
     val targetHeight: Long = 0,
     val balance: BalanceDto = BalanceDto(),
+    // Absent on a native library that predates the flag; false then, which BeamBalance.isLoaded
+    // compensates for once the wallet reports a synced state.
+    val balanceLoaded: Boolean = false,
     val transactions: List<TransactionDto> = emptyList(),
     val restoreCurrent: Long? = null,
     val restoreTarget: Long? = null,
     val syncDone: Long? = null,
     val syncTotal: Long? = null,
+    // Diagnostic only: never reaches BackendSnapshot, only the log line below. Climbing while
+    // syncDone stands still identifies the body-pack quorum re-request loop.
+    val quorumRequests: Long = 0,
     val restoreBytes: Long? = null,
     val restoreTotalBytes: Long? = null,
     val failureMessage: String? = null,
@@ -577,10 +590,15 @@ private data class SnapshotDto(
         offlineSigningState = offlineSigning.toDomain(),
         currentHeight = currentHeight,
         targetHeight = targetHeight,
-        balance = balance.toDomain(phase == BackendPhase.Ready.name),
+        balance = balance.toDomain(
+            authoritative = phase == BackendPhase.Ready.name,
+            loaded = balanceLoaded,
+        ),
         transactions = transactions.map(TransactionDto::toDomain),
         restoreCurrent = restoreCurrent,
         restoreTarget = restoreTarget,
+        syncDone = syncDone,
+        syncTotal = syncTotal,
         restoreBytes = restoreBytes,
         restoreTotalBytes = restoreTotalBytes,
         failureMessage = failureMessage,
@@ -589,21 +607,23 @@ private data class SnapshotDto(
     )
 }
 
+// Internal only because SnapshotDto is: a private type cannot appear in an internal signature.
 @Serializable
-private data class BalanceDto(
+internal data class BalanceDto(
     val available: Long = 0,
     val receiving: Long = 0,
     val sending: Long = 0,
     val maturing: Long = 0,
     val shielded: Long = 0,
 ) {
-    fun toDomain(authoritative: Boolean): BeamBalance = BeamBalance(
+    fun toDomain(authoritative: Boolean, loaded: Boolean): BeamBalance = BeamBalance(
         available = available,
         receiving = receiving,
         sending = sending,
         maturing = maturing,
         shielded = shielded,
         isAuthoritative = authoritative,
+        loadedFromDatabase = loaded,
     )
 }
 
@@ -720,8 +740,9 @@ private fun ResolutionDto.toDomain(): BeamSendResolution {
     }
 }
 
+// Internal only because SnapshotDto is: a private type cannot appear in an internal signature.
 @Serializable
-private data class OfflineSigningDto(
+internal data class OfflineSigningDto(
     val phase: String = "Unavailable",
     val contextId: String = "",
     val height: Long = 0,

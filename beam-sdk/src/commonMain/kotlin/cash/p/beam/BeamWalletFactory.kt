@@ -414,7 +414,7 @@ private fun cash.p.beam.internal.BackendSnapshot.toWalletState(): BeamWalletStat
     BackendPhase.ScanningWalletOutputs -> restoreState(BeamRestorePhase.ScanningWalletOutputs)
     BackendPhase.ImportingSnapshot -> restoreState(BeamRestorePhase.ImportingSnapshot)
     BackendPhase.CatchingUp -> restoreState(BeamRestorePhase.CatchingUp)
-    BackendPhase.Syncing -> BeamWalletState.Syncing(currentHeight, targetHeight)
+    BackendPhase.Syncing -> BeamWalletState.Syncing(currentHeight, targetHeight, syncDone, syncTotal)
     BackendPhase.Ready -> BeamWalletState.Ready(currentHeight)
     BackendPhase.Offline -> BeamWalletState.Offline(currentHeight.takeIf { it > 0 })
     BackendPhase.Error -> BeamWalletState.Error(

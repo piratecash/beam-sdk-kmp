@@ -166,6 +166,9 @@ struct NativeSnapshot {
     std::uint64_t syncDone = 0;
     std::uint64_t syncTotal = 0;
     bool hasSyncProgress = false;
+    // Diagnostic only: body-pack quorum re-requests issued so far. A value that climbs while
+    // syncDone stands still is the signature of the same-peer re-request loop.
+    std::uint64_t quorumRequests = 0;
     std::uint64_t restoreBytes = 0;
     std::uint64_t restoreTotalBytes = 0;
     bool hasRestoreBytes = false;
@@ -1005,6 +1008,9 @@ public:
         database_.reset();
         reactor_.reset();
         snapshot_ = NativeSnapshot{};
+        // The flag describes the amounts in snapshot_, so it cannot outlive them: leaving it set
+        // here would advertise a loaded balance that was just zeroed.
+        initialStatusLoaded_ = false;
         std::lock_guard<std::mutex> contextLock(offlineStateMutex_);
         offlineState_ = {};
     }
@@ -1022,6 +1028,9 @@ public:
                 {"maturing", snapshot_.maturing},
                 {"shielded", snapshot_.shielded},
             }},
+            // Tells the consumer that the amounts above came from the wallet database, so a
+            // syncing wallet can show a real balance instead of a zero that means "unknown".
+            {"balanceLoaded", initialStatusLoaded_},
             {"transactions", Json::array()},
             {"failureMessage", snapshot_.failureMessage.empty() ? Json(nullptr) : Json(snapshot_.failureMessage)},
             {"failureRetryable", snapshot_.failureRetryable},
@@ -1049,6 +1058,7 @@ public:
         if (snapshot_.hasSyncProgress) {
             result["syncDone"] = snapshot_.syncDone;
             result["syncTotal"] = snapshot_.syncTotal;
+            result["quorumRequests"] = snapshot_.quorumRequests;
         }
         if (snapshot_.hasRestoreBytes) {
             result["restoreBytes"] = snapshot_.restoreBytes;
@@ -1728,6 +1738,11 @@ public:
                     snapshot_.currentHeight,
                     wallet->get_TipHeight()
                 );
+                // Read here rather than in snapshotJson: the counter is a plain size_t owned by
+                // the wallet client thread, which is the thread this callback runs on. Reading it
+                // from the polling thread would be a cross-thread read of a non-atomic value.
+                snapshot_.quorumRequests =
+                    static_cast<std::uint64_t>(wallet->GetBodyPackQuorumRequests());
             }
         }
         if (recoveryQuorumFailed_ || bootstrapFailed_) {

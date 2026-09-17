@@ -18,6 +18,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class BeamWalletFactoryTest {
@@ -125,6 +126,78 @@ class BeamWalletFactoryTest {
         session.stop()
 
         session.awaitStopped()
+        assertFalse(session.balance.value.isAuthoritative)
+    }
+
+    @Test
+    fun session_stopAndRestart_keepTheAmountsTheDatabaseReported() = runTest {
+        // The backend publishes no stopped snapshot here, so the session's own cached-balance
+        // copies are the only thing that can still be reporting the amounts after the assertions.
+        val backend = FakeBackend()
+        backend.publishSnapshotOnStop = false
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+
+        session.start()
+        session.state.first { it is BeamWalletState.Ready }
+        backend.emitBalance(
+            BeamBalance(available = 4200, receiving = 7, loadedFromDatabase = true, isAuthoritative = true)
+        )
+        session.balance.first { it.available == 4200L }
+
+        session.stop()
+        session.awaitStopped()
+
+        // A stop withdraws the right to spend, not the amounts: the balance row keeps showing them.
+        assertEquals(4200, session.balance.value.available)
+        assertEquals(7, session.balance.value.receiving)
+        assertTrue(session.balance.value.isLoaded)
+        assertFalse(session.balance.value.isAuthoritative)
+
+        // The start path clears authority on the same cached balance and must keep the amounts too.
+        val restartEntered = CompletableDeferred<Unit>()
+        backend.startEntered = restartEntered
+        backend.suspendStart = true
+        val restart = launch { session.start() }
+        // The backend is entered only after start() has taken the mutex, moved to Connecting and
+        // rewritten the cached balance, so this is a deterministic observation of that copy.
+        restartEntered.await()
+        assertIs<BeamWalletState.Connecting>(session.state.value)
+
+        assertEquals(4200, session.balance.value.available)
+        assertEquals(7, session.balance.value.receiving)
+        assertTrue(session.balance.value.isLoaded)
+        assertFalse(session.balance.value.isAuthoritative)
+        restart.cancel()
+        restart.join()
+    }
+
+    @Test
+    fun session_cancelledStart_keepsTheAmountsTheDatabaseReported() = runTest {
+        val startEntered = CompletableDeferred<Unit>()
+        val backend = FakeBackend(startEntered = startEntered, suspendStart = true)
+        backend.publishSnapshotOnStop = false
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+
+        // What the wallet database reported before the node was ever contacted.
+        backend.emitBalance(BeamBalance(available = 4200, receiving = 7, loadedFromDatabase = true))
+        session.balance.first { it.available == 4200L }
+
+        val attempt = launch { session.start() }
+        startEntered.await()
+        assertEquals(4200, session.balance.value.available)
+        assertTrue(session.balance.value.isLoaded)
+        assertFalse(session.balance.value.isAuthoritative)
+
+        // Cancelling a start that never reached the node runs the cleanup path, which stops the
+        // backend and rewrites the cached balance; it must not drop the amounts either.
+        attempt.cancel()
+        attempt.join()
+        session.awaitStopped()
+
+        assertEquals(1, backend.stopCalls)
+        assertEquals(4200, session.balance.value.available)
+        assertEquals(7, session.balance.value.receiving)
+        assertTrue(session.balance.value.isLoaded)
         assertFalse(session.balance.value.isAuthoritative)
     }
 
@@ -277,6 +350,39 @@ class BeamWalletFactoryTest {
     }
 
     @Test
+    fun syncingState_carriesScanCounters() = runTest {
+        // The height pair follows the chain tip, so it can sit still or grow while blocks are
+        // being scanned. syncDone/syncTotal are the only numbers that actually advance, and the
+        // public state has to carry them for a progress indicator to mean anything.
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+
+        backend.emitSyncing(currentHeight = 100, targetHeight = 200, syncDone = 1173, syncTotal = 1226)
+
+        val state = session.state.first { it is BeamWalletState.Syncing } as BeamWalletState.Syncing
+        assertEquals(100, state.currentHeight)
+        assertEquals(200, state.targetHeight)
+        assertEquals(1173, state.syncDone)
+        assertEquals(1226, state.syncTotal)
+    }
+
+    @Test
+    fun syncingState_withoutScanCounters_keepsThemNull() = runTest {
+        // An older native library reports no counters. The state must stay usable rather than
+        // inventing a number, so the consumer can fall back to the height ratio.
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+
+        backend.emitSyncing(currentHeight = 100, targetHeight = 200, syncDone = null, syncTotal = null)
+
+        val state = session.state.first { it is BeamWalletState.Syncing } as BeamWalletState.Syncing
+        assertEquals(100, state.currentHeight)
+        assertEquals(200, state.targetHeight)
+        assertNull(state.syncDone)
+        assertNull(state.syncTotal)
+    }
+
+    @Test
     fun receiveAddress_stoppedWallet_forwardsToBackend() = runTest {
         val backend = FakeBackend()
         val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
@@ -425,17 +531,34 @@ private class FakeBackend(
     private val allowClose: CompletableDeferred<Unit>? = null,
     private val stopStarted: CompletableDeferred<Unit>? = null,
     private val allowStop: CompletableDeferred<Unit>? = null,
-    private val startEntered: CompletableDeferred<Unit>? = null,
-    private val suspendStart: Boolean = false,
+    var startEntered: CompletableDeferred<Unit>? = null,
+    var suspendStart: Boolean = false,
     private val backendActivated: CompletableDeferred<Unit>? = null,
     private val allowStartReturn: CompletableDeferred<Unit>? = null,
 ) : BeamBackend {
     private val mutableSnapshot = MutableStateFlow(BackendSnapshot())
     private val transactionItems = List(transactionCount) { index -> transaction("tx-$index") }
 
+    // The JNI backend publishes its stopped snapshot only after the native read succeeds, so a
+    // failing read leaves the session's own cached balance as the single source of the amounts.
+    // Tests that pin those copies turn the republish off to remove the competing source.
+    var publishSnapshotOnStop: Boolean = true
+
     override val snapshot: StateFlow<BackendSnapshot> = mutableSnapshot
     fun emitContext(value: BeamOfflineSigningState) {
         mutableSnapshot.value = mutableSnapshot.value.copy(offlineSigningState = value)
+    }
+    fun emitBalance(value: BeamBalance) {
+        mutableSnapshot.value = mutableSnapshot.value.copy(balance = value)
+    }
+    fun emitSyncing(currentHeight: Long, targetHeight: Long, syncDone: Long?, syncTotal: Long?) {
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            phase = BackendPhase.Syncing,
+            currentHeight = currentHeight,
+            targetHeight = targetHeight,
+            syncDone = syncDone,
+            syncTotal = syncTotal,
+        )
     }
     var createCalls = 0
     var startCalls = 0
@@ -486,6 +609,7 @@ private class FakeBackend(
         stopCalls++
         stopStarted?.complete(Unit)
         allowStop?.await()
+        if (!publishSnapshotOnStop) return
         // Mirror the JNI backend: a stop publishes a Stopped snapshot, so a Ready snapshot that
         // was still being collected on the session scope is always followed by Stopped.
         mutableSnapshot.value = mutableSnapshot.value.copy(

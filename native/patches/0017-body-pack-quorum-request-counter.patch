@@ -1,0 +1,48 @@
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -1976,6 +1976,7 @@
+         repeated->m_StartHeight = request.m_StartHeight;
+         repeated->m_RecoveryGeneration = request.m_RecoveryGeneration;
+         repeated->m_RecoveryExcludedAddress = request.m_RecoveryResponder;
++        ++m_BodyPackQuorumRequests;
+         PostReqUnique(*repeated);
+         return false;
+     }
+@@ -2797,6 +2798,12 @@
+         return m_LastSyncTotal + m_RequestedBlocks;
+     }
+ 
++    // Diagnostic counter for the body-pack quorum loop. See m_BodyPackQuorumRequests.
++    size_t Wallet::GetBodyPackQuorumRequests() const
++    {
++        return m_BodyPackQuorumRequests;
++    }
++
+     void Wallet::CheckSyncDone()
+     {
+         ReportSyncProgress();
+diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
+--- a/wallet/core/wallet.h
++++ b/wallet/core/wallet.h
+@@ -230,6 +230,9 @@
+         void RequestAssetsListAt(Height h, std::function<void(std::vector<beam::Asset::Full>&&)>&& onRequestComplete);
+         bool IsConnectedToOwnNode() const;
+         bool CanDetectCoins() const;
++        // Diagnostic counter for the body-pack quorum loop. Public because the JNI bridge reads
++        // it; see m_BodyPackQuorumRequests.
++        size_t GetBodyPackQuorumRequests() const;
+         void EnableBodyRequests(bool value);
+         void assertThread() const; // throws if not in wallet thread
+         void markAppNotificationAsRead(const TxID& id);
+@@ -624,6 +627,10 @@
+         io::Address m_HistoricalHeaderCandidatePeer;
+         uint8_t m_BodyQuorumRetries = 0;
+         uint8_t m_BodyPackQuorumRetries = 0;
++        // Counts re-requests issued by CheckBodyPackQuorum, including the same-peer
++        // fall-through that leaves m_BodyPackQuorumRetries untouched. Diagnostic only:
++        // nothing reads it to decide anything, and it is never reset while the wallet lives.
++        size_t m_BodyPackQuorumRequests = 0;
+         uint8_t m_ShieldedBoundaryQuorumRetries = 0;
+         uint8_t m_HistoricalHeaderQuorumRetries = 0;
+         std::function<void(const std::string&)> m_BodyQuorumFailureHandler;
