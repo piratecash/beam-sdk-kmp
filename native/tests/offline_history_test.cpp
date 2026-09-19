@@ -1,6 +1,7 @@
 // Dedicated JNI fixture: compile with BEAM_SDK_KMP_TESTS and the bridge's
 // include/link settings, then load it alongside the instrumented production bridge.
 #include "../src/beam_jni.cpp"
+#include "offline_record_fixture.h"
 
 namespace {
 
@@ -39,6 +40,50 @@ public:
         beam::wallet::storage::setVar(*session.database_, kRestoreInitializedVar, initialized);
         flushDatabase(session.database_);
         require(Json::parse(session.transactions(0, 10)).empty(), "Create exposed seeded history");
+        session.close();
+    }
+
+    // An interrupted offline signing that open() drops, or signed offline rows history hides until observed.
+    static void seedOffline(const std::string& directory, bool interrupted) {
+        Session session(1, directory, false, 0);
+        session.create(std::vector<std::uint8_t>(64, 0x31), key(), -1, "");
+        Rules::Scope rules(session.rules_);
+        beam::io::Reactor::Scope reactor(*session.reactor_);
+        auto& db = *session.database_;
+        beam::wallet::WalletAddress address;
+        db.createAddress(address);
+        db.saveAddress(address);
+        const auto receiver = beam::wallet::GeneratePublicToken(address, db, "");
+        auto offline = [&](std::uint8_t id, Timestamp created, SendState state, Height observed) {
+            auto row = transaction(id, created, TxType::PushTransaction);
+            row.m_sender = true;
+            row.m_status = TxStatus::Registering;
+            db.saveTx(row);
+            if (observed)
+                beam::wallet::storage::setTxParameter(db, row.m_txId, TxParameterID::KernelProofHeight, observed, false);
+            const auto record = syntheticOfflineRecord("offline-" + std::to_string(id), row.m_txId, receiver,
+                row.m_amount, row.m_fee, state, session.requestDigest(receiver, row.m_amount, "", row.m_fee).second);
+            saveSendRecord(db, record);
+            return row.m_txId;
+        };
+        if (interrupted) {
+            const auto id = offline(5, 500, SendState::Signing, 0);
+            beam::wallet::Coin input(20'000'000);
+            input.m_confirmHeight = 1;
+            input.m_maturity = 1;
+            input.m_spentTxId = id;
+            db.storeCoin(input);
+            beam::wallet::Coin change(9'000'000);
+            change.m_createTxId = id;
+            db.storeCoin(change);
+        } else {
+            offline(6, 600, SendState::Exported, 0);
+            offline(7, 700, SendState::Exported, 77);
+            db.saveTx(transaction(8, 800, TxType::Simple));
+            setRawString(db, sendRecordKey("unreadable").c_str(), "{ damaged");
+        }
+        beam::wallet::storage::setVar(db, kRestoreInitializedVar, true);
+        flushDatabase(session.database_);
         session.close();
     }
 
@@ -171,6 +216,35 @@ public:
             require(Json::parse(session.transactions(0, 10)).empty(), "Remove retained history");
             session.onTransactions(ChangeAction::Reset, {});
             require(Json::parse(session.transactions(0, 10)).empty(), "Empty Reset retained history");
+        }
+        {
+            auto interrupted = directory + "/offline-interrupted";
+            seedOffline(interrupted, true);
+            Session session(1, interrupted, false, 0);
+            session.open(key());
+            TxID id{};
+            id.back() = 5;
+            SendRecord record;
+            require(!loadSendRecord(*session.database_, "offline-5", record) && !session.database_->getTx(id) &&
+                Json::parse(session.transactions(0, 10)).empty(), "Open kept an interrupted offline signing");
+            unsigned coins = 0;
+            session.database_->visitCoins([&](const beam::wallet::Coin& c) {
+                require(c.m_spentTxId != id && c.m_createTxId != id, "Open kept an interrupted reservation");
+                ++coins;
+                return true;
+            });
+            require(coins == 1, "Open did not drop the interrupted change output");
+        }
+        {
+            auto signedRows = directory + "/offline-signed";
+            seedOffline(signedRows, false);
+            Session session(1, signedRows, false, 0);
+            session.open(key()); // the unreadable record defeats the sweep, never the open
+            auto rows = Json::parse(session.transactions(0, 10));
+            require(rows.size() == 2 && rows[0]["createdAtEpochSeconds"] == 800 &&
+                rows[1]["createdAtEpochSeconds"] == 700, "Unobserved offline send appeared in history");
+            require(rows[1]["status"] == "Completed" && rows[1]["proofHeight"] == 77,
+                "Observed offline send was not shown as Completed");
         }
         for (bool wrongNetwork : {false, true}) {
             Session rejected(wrongNetwork ? 0 : 1, path, false, 0);

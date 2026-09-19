@@ -235,6 +235,8 @@ public data class BeamSendOperation(
     val mainKernelId: String? = null,
     /** Original kernel and all inputs observed at this height; zero means unconfirmed/unknown. */
     val observedProofHeight: Long = 0,
+    /** Creation time of the Core transaction row; null before one exists. */
+    val createdAtEpochSeconds: Long? = null,
 )
 
 public sealed interface BeamSendResolution {

@@ -28,6 +28,40 @@ public:
         owner.get_History().AddStates(&tip, 1);
         owner.OnRolledBack();
     }
+    // What a completed recovery opens: admission and coin selection.
+    // Body recognition of the transaction's own outputs, i.e. the change coming back from chain.
+    static void receive(Wallet& owner, Height h, const Transaction& tx) {
+        const auto kdf = owner.m_WalletDB->get_MasterKdf();
+        for (const auto& output : tx.m_vOutputs) {
+            proto::Event::Utxo event;
+            if (!output->Recover(h, *kdf, event.m_Cid)) continue;
+            event.m_Commitment = output->m_Commitment;
+            event.m_Maturity = output->get_MinMaturity(h);
+            event.m_Flags = proto::Event::Flags::Add;
+            owner.ProcessRecoveryEvent(h, event);
+        }
+    }
+    static void admit(Wallet& owner) {
+        owner.m_RecoveryAdmission = true;
+        std::dynamic_pointer_cast<WalletDB>(owner.m_WalletDB)->SetSelectionAllowed(true);
+    }
+    // What body recognition records when the block carrying the transaction spends its inputs.
+    static void spend(Wallet& owner, Height h, const std::vector<CoinID>& ordinary,
+        const std::vector<IPrivateKeyKeeper2::ShieldedInput>& shielded) {
+        for (const auto& id : ordinary) {
+            proto::Event::Utxo event;
+            event.m_Cid = id; event.m_Flags = 0;
+            require(owner.m_WalletDB->get_CommitmentSafe(event.m_Commitment, id), "missing input commitment");
+            owner.ProcessRecoveryEvent(h, event);
+        }
+        for (const auto& input : shielded) {
+            const auto coin = owner.m_WalletDB->getShieldedCoin(input.m_Key);
+            require(bool(coin), "missing shielded input");
+            proto::Event::Shielded event;
+            event.m_CoinID = coin->m_CoinID; event.m_TxoID = coin->m_TxoID; event.m_Flags = 0;
+            owner.ProcessRecoveryEvent(h, event);
+        }
+    }
 };
 }
 
@@ -116,6 +150,50 @@ public:
     SendRecord record(const std::string& operation) {
         SendRecord r; require(loadSendRecord(*db, operation, r), "missing durable operation"); return r;
     }
+    bool reserved(const TxID& id) {
+        bool found = false;
+        db->visitCoins([&](const Coin& c) { found |= c.m_spentTxId == id; return true; });
+        db->visitShieldedCoins([&](const ShieldedCoin& c) { found |= c.m_spentTxId == id; return true; });
+        return found;
+    }
+    void requireReleased(const TxID& id) {
+        db->visitCoins([&](const Coin& c) {
+            require(c.m_spentTxId != id && c.m_createTxId != id, "offline transaction held ordinary coin state");
+            return true;
+        });
+        db->visitShieldedCoins([&](const ShieldedCoin& c) {
+            require(c.m_spentTxId != id && c.m_createTxId != id, "offline transaction held shielded coin state");
+            return true;
+        });
+    }
+    Amount spendable() {
+        Amount total = 0;
+        db->visitCoins([&](const Coin& c) {
+            if (c.m_confirmHeight != MaxHeight && c.m_spentHeight == MaxHeight && !c.m_spentTxId) total += c.m_ID.m_Value;
+            return true;
+        });
+        db->visitShieldedCoins([&](const ShieldedCoin& c) {
+            if (c.m_confirmHeight != MaxHeight && c.m_spentHeight == MaxHeight && !c.m_spentTxId) total += c.m_CoinID.m_Value;
+            return true;
+        });
+        return total;
+    }
+    void syncTo(const Block::SystemState::Full& tip) {
+        HeightHash id; tip.get_ID(id);
+        db->get_History().AddStates(&tip, 1); db->setSystemStateID(id);
+    }
+    Json operation(const std::string& operationId) {
+        for (const auto& item : Json::parse(session.sendOperations()))
+            if (item.at("operationId") == operationId) return item;
+        throw std::runtime_error("missing send operation");
+    }
+    // What open(), start() and signOffline() run first.
+    void sweep() { session.sweepOfflineLeftovers(nullptr); }
+    const TransactionSnapshot* shown(const TxID& id) {
+        for (const auto& item : session.snapshot_.transactions)
+            if (item.transaction.m_txId == id) return &item;
+        return nullptr;
+    }
     void fault(const std::string& point) {
         session.sendBoundaryForTests_ = [point](const char* current) {
             if (point == current) throw std::runtime_error("injected offline durability boundary");
@@ -193,6 +271,47 @@ public:
         db->SetSelectionAllowed(true); // return to the fixture's already imported prior-sync boundary
     }
 };
+
+// Forwards Core row changes into the session's history view, as the running client does.
+struct HistoryFeed : IWalletDbObserver {
+    WalletDB& db;
+    Session& session;
+    HistoryFeed(WalletDB& database, Session& owner) : db(database), session(owner) {
+        db.Subscribe(this);
+        session.onTransactions(ChangeAction::Reset, db.getTxHistory(TxType::ALL, 0, std::numeric_limits<int>::max()));
+    }
+    ~HistoryFeed() { db.Unsubscribe(this); }
+    void onTransactionChanged(ChangeAction action, const std::vector<TxDescription>& items) override {
+        session.onTransactions(action, items);
+    }
+};
+
+class KernelNetwork : public proto::FlyClient::NetworkStd {
+public:
+    explicit KernelNetwork(Wallet& wallet) : NetworkStd(wallet) {}
+    unsigned kernels = 0, other = 0;
+    void PostRequestInternal(proto::FlyClient::Request& r) override {
+        ++(r.get_Type() == proto::FlyClient::Request::Kernel ? kernels : other);
+    }
+};
+
+proto::ProofKernel kernelProof(NodeProcessor& node, const Merkle::Hash& kernel) {
+    proto::ProofKernel proof;
+    NodeDB::StateID sid;
+    require(node.get_ProofKernel(&proof.m_Proof.m_Inner, nullptr, sid, kernel, nullptr) != 0,
+        "independent node lost the exported kernel");
+    node.get_DB().get_State(sid.m_Row, proof.m_Proof.m_State);
+    Merkle::ProofBuilderHard builder;
+    node.m_Mmr.m_States.get_Proof(builder, node.m_Mmr.m_States.N2I(proof.m_Proof.m_State.m_Number));
+    proof.m_Proof.m_Outer.swap(builder.m_Proof);
+    struct HistoryProof : NodeProcessor::ProofBuilderHard {
+        using NodeProcessor::ProofBuilderHard::ProofBuilderHard;
+        bool get_History(Merkle::Hash&) override { return false; }
+    } historyProof(node, proof.m_Proof.m_Outer);
+    historyProof.GenerateProof();
+    require(node.m_Cursor.m_Full.IsValidProofKernel(kernel, proof.m_Proof), "exported kernel proof invalid");
+    return proof;
+}
 
 // Stop inside the real builder's output notification, before keykeeper completion.
 // Flush models the DB timer committing this row while the operation is still Signing.
@@ -289,6 +408,7 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
             require(signedResult.at("state") == "Signed", "SDK did not persist Signed");
             auto record = f.record("full-" + std::to_string(scenario));
             require(record.inputs.size() && record.shieldedInputs.size(), "Signed omitted atomic input inventories");
+            f.requireReleased(parseTxId(record.txId));
             f.fault("offline-exported");
             rejects([&] { f.session.exportSignedTransaction(record.operationId); }, "lost export response missing");
             f.clearFault();
@@ -313,13 +433,16 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
             require(f.sign(record.operationId, receiver.token, q, maximum).at("state") == "Exported", "retry regenerated payment");
             const auto inventory = Json::parse(f.session.sendOperations());
             require(inventory.size() == 1 && inventory[0].at("deliveryMode") == "Offline", "stopped inventory lost own signed send");
+            require(inventory[0].at("createdAtEpochSeconds") == f.db->getTx(parseTxId(record.txId))->m_createTime,
+                "inventory lost the Core creation time");
             if (production) std::cout << "PRODUCTION_SIGNER_CASE_OK " << scenario
                 << " proof=" << (historical ? 1024 : 65536) << std::endl;
         }
     if (production) return;
 #ifndef _WIN32
     for (const std::string point : {"offline-intent-record", "offline-intent", "offline-core-created",
-        "offline-signed-record", "offline-signed", "offline-exported-record", "offline-exported",
+        "offline-signed-record", "offline-signed", "offline-release-record", "offline-released",
+        "offline-exported-record", "offline-exported",
         "offline-abort-record", "offline-aborted", "pending-self-offline", "pending-max-privacy",
         "pending-self-offline-abort", "pending-max-privacy-abort"}) {
         const auto childDir = dir / ("process-" + point);
@@ -351,8 +474,9 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
             f.db->visitShieldedCoins([](const ShieldedCoin& c) { require(!c.m_spentTxId, "kill left shielded reserve"); return true; });
         } else {
             const auto expected = point == "offline-exported" ? SendState::Exported :
-                (point == "offline-signed" || point == "offline-exported-record" ||
-                    point == "offline-abort-record") ? SendState::Signed : SendState::Signing;
+                (point == "offline-signed" || point == "offline-release-record" || point == "offline-released" ||
+                    point == "offline-exported-record" || point == "offline-abort-record") ? SendState::Signed :
+                SendState::Signing;
             require(present && record.state == expected, "kill crossed a durable state fence");
             if (point.find("pending-") == 0) {
                 require(expected == SendState::Signing && !f.pendingOutputs(parseTxId(record.txId)).empty(),
@@ -366,14 +490,7 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
                     require(f.pendingOutputs(id).empty() && !f.db->getTx(id) &&
                         Json::parse(f.session.sendOperations()).empty(), "interrupted abort left self output/intent");
                     require(!f.quote(record.receiver, record.amount).empty(), "interrupted abort/reopen poisoned context");
-                    f.db->visitCoins([&](const Coin& c) {
-                        require(c.m_spentTxId != id && c.m_createTxId != id, "Signing abort left ordinary state");
-                        return true;
-                    });
-                    f.db->visitShieldedCoins([&](const ShieldedCoin& c) {
-                        require(c.m_spentTxId != id && c.m_createTxId != id, "Signing abort left shielded state");
-                        return true;
-                    });
+                    f.requireReleased(id);
                     std::cout << "OFFLINE_SIGNER_PROCESS_KILL_OK " << point << std::endl;
                     continue;
                 }
@@ -381,22 +498,40 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
             if (point == "offline-intent") require(f.db->getTxHistory(TxType::ALL, 0, std::numeric_limits<int>::max()).empty(), "Core preceded intent");
             if (expected != SendState::Signing) {
                 require(!record.rawHex.empty(), "durable Signed lost bytes");
-                Coin ordinary = funds.ordinary;
-                require(f.db->findCoin(ordinary) && ordinary.m_spentTxId == parseTxId(record.txId),
-                    "Signed bytes preceded durable ordinary reserve");
-                bool reserved = false;
-                f.db->visitShieldedCoins([&](const ShieldedCoin& c) {
-                    reserved |= c.m_spentTxId == parseTxId(record.txId); return true;
-                });
-                require(reserved, "Signed bytes preceded durable shielded reserve");
+                const auto id = parseTxId(record.txId);
+                // Only a kill between the Signed flush and its release leaves the signing reservation.
+                if (point == "offline-signed" || point == "offline-release-record") {
+                    Coin ordinary = funds.ordinary;
+                    require(f.db->findCoin(ordinary) && ordinary.m_spentTxId == id,
+                        "Signed bytes preceded durable ordinary reserve");
+                    bool reserved = false;
+                    f.db->visitShieldedCoins([&](const ShieldedCoin& c) { reserved |= c.m_spentTxId == id; return true; });
+                    require(reserved, "Signed bytes preceded durable shielded reserve");
+                } else {
+                    f.requireReleased(id);
+                }
             }
             f.assertNoResume(record); f.assertNoSdkRecovery();
             Json q = {{"amount", record.amount}, {"version", record.quoteVersion}};
+            if (expected == SendState::Signing && point.find("pending-") != 0) {
+                // What open() runs first: the interrupted intent goes and a retry signs anew.
+                const auto old = parseTxId(record.txId);
+                f.session.sweepOfflineLeftoversOnOpen();
+                SendRecord gone;
+                require(!loadSendRecord(*f.db, record.operationId, gone) && !f.db->getTx(old),
+                    "open sweep kept an interrupted signing");
+                f.requireReleased(old);
+                q = f.quote(record.receiver, record.amount);
+                f.sign(record.operationId, record.receiver, q);
+                record = f.record(record.operationId);
+                require(parseTxId(record.txId) != old && !f.db->getTx(old), "retry resurrected the swept transaction");
+            }
             f.sign(record.operationId, record.receiver, q);
             const auto bytes = f.session.exportSignedTransaction(record.operationId);
             require(bytes == f.session.exportSignedTransaction(record.operationId), "kill retry changed bytes");
             if (!record.rawHex.empty()) require(bytes == from_hex(record.rawHex), "kill regenerated Signed bytes");
-            require(!f.session.abortPrepared(record.operationId), "kill/reopen released exported reserves");
+            require(!f.session.abortPrepared(record.operationId), "kill/reopen aborted an exported operation");
+            f.requireReleased(parseTxId(record.txId));
             if (point.find("pending-") == 0) {
                 NodeProcessor childNode;
                 childNode.m_Horizon.SetInfinite();
@@ -406,10 +541,9 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
                     "killed fixture node lost the wallet's prior-sync checkpoint");
                 require(relay(childNode, bytes, {"synthetic-fakepow", rules.get_SignatureStr()}) == proto::TxStatus::Ok,
                     "pending-output retry failed independent contextual validation");
-                const auto count = f.pendingOutputs(parseTxId(record.txId)).size();
-                require(count != 0, "exported abort deleted pending output");
+                // The chain recreates a self output once it lands; until then it is not a coin.
                 f.reopen();
-                require(f.pendingOutputs(parseTxId(record.txId)).size() == count &&
+                require(f.pendingOutputs(parseTxId(record.txId)).empty() &&
                     f.session.exportSignedTransaction(record.operationId) == bytes &&
                     !f.session.abortPrepared(record.operationId), "pending-output export/reopen lost ownership");
             }
@@ -423,7 +557,10 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
         OfflineSignerFixture f(dir / name, rules, node, funds, Inputs::Mixed);
         const auto receiver = f.selfReceiver(maxPrivacy);
         const auto q = f.quote(receiver, 60'000'000);
-        f.sign(name, receiver, q);
+        // A crash before the release, or an SDK 0.1.5 record, keeps the reservation and self output.
+        f.fault("offline-release-record");
+        rejects([&] { f.sign(name, receiver, q); }, "release boundary fault missing");
+        f.clearFault();
         const auto id = parseTxId(f.record(name).txId);
         const auto outputs = f.pendingOutputs(id);
         require(!outputs.empty(), "self abort regression omitted pending shielded output");
@@ -466,7 +603,8 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
     }
     // Every fence includes rollback before commit and lost response after commit, with reopen.
     for (const std::string point : {"offline-intent-record", "offline-intent", "offline-core-created",
-        "offline-signed-record", "offline-signed", "offline-exported-record", "offline-exported"}) {
+        "offline-signed-record", "offline-signed", "offline-release-record", "offline-released",
+        "offline-exported-record", "offline-exported"}) {
         OfflineSignerFixture f(dir / ("boundary-" + point), rules, node, funds, Inputs::Ordinary);
         auto receiver = chooseRecipient(dir, ++scenario + 1000, TxAddressType::PublicOffline);
         auto q = f.quote(receiver.token, 20'000'000);
@@ -480,9 +618,21 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
             require(f.db->getTxHistory(TxType::ALL, 0, std::numeric_limits<int>::max()).empty(), "Core row preceded durable offline intent");
             q = f.quote(receiver.token, 20'000'000);
         }
+        if (point == "offline-release-record") {
+            // Exported while still holding coins: what SDK 0.1.5 left on devices.
+            const auto id = parseTxId(f.record(point).txId);
+            const auto bytes = f.session.exportSignedTransaction(point);
+            require(f.reserved(id) && f.record(point).state == SendState::Exported,
+                "release fault did not leave an exported reservation");
+            f.sweep();
+            require(f.record(point).state == SendState::Exported && f.session.exportSignedTransaction(point) == bytes,
+                "sweep changed exported bytes");
+            f.requireReleased(id);
+        }
         const auto retry = f.sign(point, receiver.token, q);
         require(retry.at("state") != "Signing", "same operation did not recover after boundary");
         auto record = f.record(point); f.assertNoResume(record);
+        f.requireReleased(parseTxId(record.txId));
         auto bytes = f.session.exportSignedTransaction(point);
         require(bytes == f.session.exportSignedTransaction(point), "idempotent export changed bytes");
     }
@@ -500,6 +650,30 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
         require(f.db->getTxHistory(TxType::ALL, 0, std::numeric_limits<int>::max()).empty(), "aborted Core row remained resumable");
         require(Json::parse(f.session.sendOperations()).empty(), "aborted record remained exportable");
         rejects([&] { f.session.exportSignedTransaction(point); }, "aborted bytes escaped");
+    }
+    {
+        OfflineSignerFixture f(dir / "interrupted-sweep", rules, node, funds, Inputs::Mixed);
+        auto receiver = chooseRecipient(dir, ++scenario + 1000, TxAddressType::PublicOffline);
+        const auto q = f.quote(receiver.token, 60'000'000);
+        f.fault("offline-core-created");
+        rejects([&] { f.sign("interrupted", receiver.token, q); }, "core-created fault missing");
+        f.clearFault(); f.reopen();
+        const auto id = parseTxId(f.record("interrupted").txId);
+        require(f.record("interrupted").state == SendState::Signing && f.db->getTx(id),
+            "fixture did not leave an interrupted Signing row");
+        Json next;
+        try {
+            next = f.sign("next", receiver.token, q);
+        } catch (const beam::sdk::SendError& e) {
+            require(std::string(e.code) == "STALE_QUOTE", "leftover sweep failed the next operation");
+            next = f.sign("next", receiver.token, f.quote(receiver.token, 60'000'000));
+        }
+        SendRecord gone;
+        require(!loadSendRecord(*f.db, "interrupted", gone) && !f.db->getTx(id),
+            "interrupted Signing survived another operation");
+        f.requireReleased(id);
+        require(next.at("state") == "Signed", "operation after the sweep was not signed");
+        std::cout << "OFFLINE_SIGNER_INTERRUPTED_SWEEP_OK" << std::endl;
     }
     {
         OfflineSignerFixture f(dir / "cancel", rules, node, funds, Inputs::Mixed);
@@ -600,57 +774,124 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
         std::cout << "OFFLINE_SIGNER_SNAPSHOT_OK windows=" << context.windows->windows()
             << " items=" << context.windows->items() << " bytes=" << context.windows->bytes() << std::endl;
     }
-    {
-        OfflineSignerFixture f(dir / "original-kernel-reorg", rules, node, funds, Inputs::Mixed);
+    // Reach the chain: whoever spends first wins, history follows the kernel, one kernel round per start.
+    for (auto inputs : {Inputs::Ordinary, Inputs::Shielded, Inputs::Mixed}) {
+        const bool mixed = inputs == Inputs::Mixed;
+        const auto name = "chain-" + std::to_string(int(inputs));
+        OfflineSignerFixture f(dir / name, rules, node, funds, inputs);
         auto receiver = chooseRecipient(dir, ++scenario + 1000, TxAddressType::PublicOffline);
-        auto q = f.quote(receiver.token, 60'000'000);
-        f.sign("observed", receiver.token, q);
-        const auto bytes = f.session.exportSignedTransaction("observed");
-        const auto record = f.record("observed");
+        const Amount amount = mixed ? 60'000'000 : 20'000'000;
+        const auto before = f.spendable();
+        const auto q = f.quote(receiver.token, amount);
+        f.sign("first", receiver.token, q);
+        const auto first = parseTxId(f.record("first").txId);
+        const auto firstBytes = f.session.exportSignedTransaction("first");
+        f.requireReleased(first);
+        const auto again = f.quote(receiver.token, amount);
+        require(f.spendable() == before && again.at("fee") == q.at("fee") && again.at("change") == q.at("change") &&
+            again.at("ordinaryInputs") == q.at("ordinaryInputs") && again.at("shieldedInputs") == q.at("shieldedInputs"),
+            "exported send kept its coins from selection");
+        std::string winner = "first";
+        if (mixed) {
+            // Exported bytes hold nothing: a rival over the same coins is admitted and reaches the chain first.
+            require(f.sign("rival", receiver.token, again).at("state") == "Signed", "exported send deferred another offline send");
+            winner = "rival";
+        }
+        const auto record = f.record(winner);
         const auto id = parseTxId(record.txId);
+        const auto bytes = f.session.exportSignedTransaction(winner);
+        std::vector<CoinID> ordinaryInputs;
+        std::vector<IPrivateKeyKeeper2::ShieldedInput> shieldedInputs;
+        require(fromByteBuffer(record.inputs, ordinaryInputs) && fromByteBuffer(record.shieldedInputs, shieldedInputs) &&
+            ordinaryInputs.empty() == (inputs == Inputs::Shielded) && shieldedInputs.empty() == (inputs == Inputs::Ordinary),
+            "fixture did not spend the requested inputs");
         const auto oldTip = node.m_Cursor.m_Full;
-        auto decoded = decode(bytes);
+        const auto decoded = decode(bytes);
         const auto kernel = mainKernel(*decoded).get_ID();
-        mine(node, miner, decoded);
-        proto::ProofKernel proof;
-        NodeDB::StateID sid;
-        require(node.get_ProofKernel(&proof.m_Proof.m_Inner, nullptr, sid, kernel, nullptr) != 0,
-            "independent node lost original exported kernel");
-        node.get_DB().get_State(sid.m_Row, proof.m_Proof.m_State);
-        Merkle::ProofBuilderHard builder;
-        node.m_Mmr.m_States.get_Proof(builder, node.m_Mmr.m_States.N2I(proof.m_Proof.m_State.m_Number));
-        proof.m_Proof.m_Outer.swap(builder.m_Proof);
-        struct HistoryProof : NodeProcessor::ProofBuilderHard {
-            using NodeProcessor::ProofBuilderHard::ProofBuilderHard;
-            bool get_History(Merkle::Hash&) override { return false; }
-        } historyProof(node, proof.m_Proof.m_Outer);
-        historyProof.GenerateProof();
-        require(node.m_Cursor.m_Full.IsValidProofKernel(kernel, proof.m_Proof), "original kernel proof invalid");
-        const auto status = f.db->getTx(id)->m_status;
+        const unsigned unobserved = mixed ? 2 : 1;
         {
+            HistoryFeed feed(*f.db, f.session);
+            require(!f.shown(id) && !f.shown(first), "unobserved offline send appeared in history");
+            {
+                // A start whose round runs before mining sees nothing and asks once, whatever the tips.
+                Wallet owner(f.db);
+                auto network = std::make_shared<KernelNetwork>(owner); owner.SetNodeEndpoint(network);
+                SnapshotReorgRecoveryTestAccess::admit(owner);
+                owner.RequestOfflineKernelProofs(); owner.RequestOfflineKernelProofs();
+                require(network->kernels == unobserved && !network->other, "offline kernel check was not one round per start");
+            }
+            mine(node, miner, decode(bytes));
+            if (mixed) require(relay(node, firstBytes, {"synthetic-fakepow", rules.get_SignatureStr()}) != proto::TxStatus::Ok,
+                "node accepted the losing double spend");
+            const auto h = node.m_Cursor.m_hh.m_Height;
+            const auto proof = kernelProof(node, kernel);
             Wallet owner(f.db);
-            auto network = std::make_shared<NoNetwork>(owner); owner.SetNodeEndpoint(network);
+            auto network = std::make_shared<KernelNetwork>(owner); owner.SetNodeEndpoint(network);
             owner.RegisterTransactionType(TxType::PushTransaction,
                 std::make_shared<lelantus::PushTransaction::Creator>([&] { return f.db; }));
+            SnapshotReorgRecoveryTestAccess::admit(owner);
+            owner.RequestOfflineKernelProofs();
+            require(network->kernels == unobserved, "the next start did not ask about unobserved rows");
+            f.syncTo(node.m_Cursor.m_Full);
+            const auto status = f.db->getTx(id)->m_status;
+            // Both orders of arrival: the kernel proof before or after body recognition spends the inputs.
+            if (inputs == Inputs::Shielded) SnapshotReorgRecoveryTestAccess::spend(owner, h, ordinaryInputs, shieldedInputs);
             SnapshotReorgRecoveryTestAccess::observe(owner, id, kernel, proof);
-            Height h = 0; storage::getTxParameter(*f.db, id, TxParameterID::KernelProofHeight, h);
-            require(h == node.m_Cursor.m_hh.m_Height && f.db->getTx(id)->m_status == status,
-                "original kernel observation rewrote transaction history");
-            node.ManualRollbackTo(oldTip.m_Number);
-            SnapshotReorgRecoveryTestAccess::fork(owner, oldTip);
-            storage::getTxParameter(*f.db, id, TxParameterID::KernelProofHeight, h);
-            require(!h && f.db->getTx(id)->m_status == status && !network->requests,
-                "offline reorg rewrote history or registered transaction");
-            Coin ordinary = funds.ordinary;
-            require(f.db->findCoin(ordinary) && ordinary.m_spentTxId == id &&
-                f.db->getShieldedCoin(funds.shielded.m_CoinID.m_Key)->m_spentTxId == id,
-                "offline reorg released exported inputs");
+            if (inputs != Inputs::Shielded) SnapshotReorgRecoveryTestAccess::spend(owner, h, ordinaryInputs, shieldedInputs);
+            SnapshotReorgRecoveryTestAccess::receive(owner, h, *decoded);
+            Height observed = 0; storage::getTxParameter(*f.db, id, TxParameterID::KernelProofHeight, observed);
+            require(observed == h && f.db->getTx(id)->m_status == status, "kernel observation rewrote the Core row");
+            const auto* shown = f.shown(id);
+            require(shown && shown->transaction.m_status == TxStatus::Completed && shown->proofHeight == h,
+                "observed offline send did not appear as Completed");
+            require(f.operation(winner).at("observedProofHeight") == h, "spent inputs did not confirm the observed kernel");
+            require(f.spendable() == before - amount - again.at("fee").get<Amount>(),
+                "balance after the chain is not the pre-sign balance minus amount and fee");
+            {
+                HistoryFeed reset(*f.db, f.session);
+                require(f.shown(id) && f.shown(id)->transaction.m_status == TxStatus::Completed, "Reset lost the observed send");
+            }
+            if (mixed) {
+                require(!f.shown(first) && f.operation("first").at("observedProofHeight") == 0 &&
+                    f.record("first").state == SendState::Exported, "the losing double spend looked confirmed");
+                {
+                    Wallet restarted(f.db);
+                    auto next = std::make_shared<KernelNetwork>(restarted); restarted.SetNodeEndpoint(next);
+                    SnapshotReorgRecoveryTestAccess::admit(restarted);
+                    restarted.RequestOfflineKernelProofs();
+                    require(next->kernels == 1, "a later start asked about the observed row again");
+                }
+                node.ManualRollbackTo(oldTip.m_Number);
+                SnapshotReorgRecoveryTestAccess::fork(owner, oldTip);
+                storage::getTxParameter(*f.db, id, TxParameterID::KernelProofHeight, observed);
+                require(!observed && f.db->getTx(id)->m_status == status && !network->other,
+                    "offline reorg rewrote history or registered transaction");
+                require(!f.shown(id) && f.operation(winner).at("observedProofHeight") == 0,
+                    "reorged offline send stayed in history or confirmed");
+                f.requireReleased(id);
+            }
         }
+        if (mixed) {
+            // Re-mined on the new branch, it reappears after the next start.
+            mine(node, miner);
+            mine(node, miner, decode(bytes));
+            const auto proof = kernelProof(node, kernel);
+            HistoryFeed feed(*f.db, f.session);
+            Wallet owner(f.db);
+            auto network = std::make_shared<KernelNetwork>(owner); owner.SetNodeEndpoint(network);
+            SnapshotReorgRecoveryTestAccess::admit(owner);
+            owner.RequestOfflineKernelProofs();
+            require(network->kernels == 2, "the next start skipped the reorged row");
+            f.syncTo(node.m_Cursor.m_Full);
+            SnapshotReorgRecoveryTestAccess::observe(owner, id, kernel, proof);
+            require(f.shown(id) && f.shown(id)->proofHeight == node.m_Cursor.m_hh.m_Height, "re-mined offline send stayed hidden");
+        }
+        node.ManualRollbackTo(oldTip.m_Number); // later fixtures start from the shared prior-sync chain
         f.reopen();
-        require(f.session.exportSignedTransaction("observed") == bytes && !f.session.abortPrepared("observed"),
-            "offline reorg/reopen regenerated bytes or released reserves");
-        require(f.record("observed").state == SendState::Exported, "offline reorg changed durable export state");
-        std::cout << "OFFLINE_SIGNER_ORIGINAL_KERNEL_REORG_OK" << std::endl;
+        require(f.session.exportSignedTransaction(winner) == bytes && !f.session.abortPrepared(winner) &&
+            f.record(winner).state == SendState::Exported, "chain/reopen changed exported bytes or state");
+        std::cout << "OFFLINE_SIGNER_CHAIN_OK " << name << std::endl;
+        if (mixed) std::cout << "OFFLINE_SIGNER_ORIGINAL_KERNEL_REORG_OK" << std::endl;
     }
 }
 } // namespace

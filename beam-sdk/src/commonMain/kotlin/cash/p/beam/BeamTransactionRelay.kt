@@ -8,7 +8,7 @@ import cash.p.beam.internal.BeamRelayPlatform
  *
  * The exact canonical bytes undergo BeamTransactionInspector validation before networking.
  * Node acceptance supplies contextual validation, not confirmation. Retry identical bytes;
- * a reject, timeout, cancellation or disconnect never authorizes releasing sender reservations.
+ * a reject, timeout, cancellation or disconnect does not prove the bytes never reach the chain.
  */
 public object BeamTransactionRelay {
     /**

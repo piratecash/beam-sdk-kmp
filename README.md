@@ -79,10 +79,15 @@ aborted, while the network client is stopped.
 After a normal synchronized session prepares a durable offline-signing context, its
 `BeamOfflineSigningState.Ready.contextId` can be used with `quoteSend` and `signOffline` while the
 wallet owner is stopped. Readiness describes the saved checkpoint and does not claim that it is the
-current live tip. `signOffline` persists signed material and reservations without broadcasting or
-returning bytes. `exportSignedTransaction` durably marks the operation `Exported` before returning
-canonical bytes; repeated exports are byte-identical. Once export may have returned, abort,
-rejection, elapsed time, stop or close cannot revoke those bytes or release their inputs.
+current live tip. `signOffline` persists signed material without broadcasting or returning bytes.
+Coins are reserved only while signing runs: once the signed material is durable the inputs are free
+again and the expected change is dropped, like an unbroadcast Bitcoin transaction, so whoever spends
+them first on chain wins. An interrupted sign is discarded by the next open, start or new offline
+sign. A discarded or aborted sign still consumes one of the limited vouchers of an `Offline` or
+`MaxPrivacy` token; once they run out the receiver has to provide a new token. `exportSignedTransaction` durably marks the operation `Exported` before returning canonical
+bytes; repeated exports are byte-identical and cannot be revoked. An offline send is absent from
+`transactions` until its kernel is observed on chain, then it is reported as `Completed`; the check
+runs once per `start()`, for sends not yet observed.
 
 `BeamTokenParser` and `BeamTransactionInspector` work without wallet state or network access.
 Inspection accepts at most 1 MiB of canonical transaction bytes and also bounds vector counts,

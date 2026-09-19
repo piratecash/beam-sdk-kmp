@@ -94,6 +94,7 @@ class OfflineHistoryNativeTest {
                         assertEquals(ready.contextId, owned.contextId)
                         assertEquals(rules.signature, owned.rules)
                         assertFalse(owned.resolution is BeamSendResolution.Submitted)
+                        assertTrue(owned.createdAtEpochSeconds != null, "Signed send lost its creation time")
                         bytes = session.exportSignedTransaction(operationId)
                         val inspected = BeamTransactionInspector.inspect(bytes, rules)
                         assertEquals(bytes.size, inspected.serializedSize)
@@ -120,9 +121,11 @@ class OfflineHistoryNativeTest {
                     try {
                         assertEquals(BeamWalletState.Stopped, reopened.state.value)
                         assertEquals(exported, reopened.sendOperations().single())
-                        assertFalse(reopened.abortPrepared(operationId), "Export cannot release owned inputs")
+                        assertFalse(reopened.abortPrepared(operationId), "An exported operation cannot be aborted")
                         assertContentEquals(bytes, reopened.exportSignedTransaction(operationId))
                         assertEquals(exported, reopened.sendOperations().single())
+                        assertTrue(reopened.transactionPage(0, 10).items.none { it.id == exported.transactionId },
+                            "Unobserved offline send appeared in history")
                         assertEquals(BeamWalletState.Stopped, reopened.state.value)
                     } finally { reopened.close() }
                 }

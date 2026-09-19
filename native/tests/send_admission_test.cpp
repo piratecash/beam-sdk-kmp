@@ -4,6 +4,8 @@
 
 #include <iostream>
 
+#include "offline_record_fixture.h"
+
 namespace {
 
 void checkAdmissionTest(bool condition, const char* message) {
@@ -252,6 +254,21 @@ public:
     static void run() {
         runInventoryRecovery();
         runCounterpartyJson();
+        {
+            // Another operation's interrupted offline signing holds its coins until a sweep drops it.
+            SendAdmissionFixture f;
+            beam::wallet::WalletAddress address;
+            f.session_.database_->createAddress(address);
+            f.session_.database_->saveAddress(address);
+            const auto receiver = beam::wallet::GeneratePublicToken(address, *f.session_.database_, "");
+            const auto signing = syntheticOfflineRecord("S", beam::wallet::GenerateTxID(), receiver, 100'000, 100,
+                SendState::Signing, f.session_.requestDigest(receiver, 100'000, "", 100).second);
+            saveSendRecord(*f.session_.database_, signing);
+            flushDatabase(f.session_.database_);
+            expectDeferred([&] { f.prepare("B"); });
+            f.session_.sweepOfflineLeftovers(nullptr);
+            checkAdmissionTest(!f.prepare("B").txId.empty(), "Swept offline signing still deferred a send");
+        }
         {
             SendAdmissionFixture f;
             const auto a = f.prepare("A");

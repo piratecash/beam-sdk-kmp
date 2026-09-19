@@ -11,13 +11,14 @@ diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
          virtual ~Wallet();
          void CleanupNetwork();
  
-@@ -166,6 +167,14 @@
+@@ -166,6 +167,15 @@
          bool IsRecoveryAdmissionOpen() const { return !m_RecoveryPolicy || m_RecoveryAdmission; }
          uint64_t TransactionEpoch() const { return m_TransactionEpoch; }
          bool CanProcessTransaction(const BaseTransaction&) const;
 +        // SDK intent is in the encrypted operation record, before any Core row. Unknown
 +        // records fence all transaction construction. Offline membership never joins resume.
 +        bool IsOfflineTransaction(const TxID&) const;
++        bool CollectOfflineTransactions(std::set<std::string>& hexIds) const;
 +        bool IsOfflineSigningIntent(const TxID&) const;
 +        void RequestOfflineKernelProofs();
 +        BaseTransaction::Ptr BeginOfflineTransaction(const TxParameters&, INegotiatorGateway&,
@@ -26,13 +27,14 @@ diff --git a/wallet/core/wallet.h b/wallet/core/wallet.h
          void ConfigureRecoveryQuorum();
          // Owner-thread notification only; false fences context work before tip/recovery changes.
          // Does not alter transaction admission, active membership, or startup resume.
-@@ -622,6 +631,9 @@
+@@ -622,6 +632,10 @@
  
          // List of currently active (incomplete) transactions
          std::map<TxID, BaseTransaction::Ptr> m_ActiveTransactions;
 +        ExecutionMode m_ExecutionMode;
 +        BaseTransaction::Ptr m_OfflineTransaction;
 +        std::function<bool()> m_OfflineAdmission;
++        bool m_OfflineKernelProofsRequested = false;
  
          // List of transactions that are waiting for the next tip (new block) to arrive
          std::unordered_set<BaseTransaction::Ptr> m_NextTipTransactionToUpdate;
@@ -125,57 +127,61 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          BEAM_LOG_INFO() << "deleting tx " << txId;
          if (auto it = m_ActiveTransactions.find(txId); it == m_ActiveTransactions.end())
          {
-@@ -1424,6 +1434,18 @@
-             // Recovery proof requests cannot call a transaction object or failure transition.
+@@ -1425,6 +1435,18 @@
              m_RecoveryProofHeights[r.m_TxID] = r.m_Res.m_Proof.empty() ? 0 : r.m_Res.m_Proof.m_State.get_Height();
              return;
-+        }
+         }
 +        if (IsOfflineTransaction(r.m_TxID))
 +        {
 +            auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
 +            try
 +            {
 +                const Height h = r.m_Res.m_Proof.empty() ? 0 : r.m_Res.m_Proof.m_State.get_Height();
-+                storage::setTxParameter(*db, r.m_TxID, TxParameterID::KernelProofHeight, h, false);
++                storage::setTxParameter(*db, r.m_TxID, TxParameterID::KernelProofHeight, h, true);
 +                db->FlushNow();
 +            }
 +            catch (...) { db->RollbackNow(false); throw; }
 +            return; // no status/failure/rollback/reservation transitions
-         }
++        }
          if (!r.m_Res.m_Proof.empty())
              m_WalletDB->get_History().AddStates(&r.m_Res.m_Proof.m_State, 1); // why not?
-@@ -2166,8 +2188,106 @@
+ 
+@@ -2166,8 +2188,117 @@
  #endif
      }
  
-+    bool Wallet::IsOfflineTransaction(const TxID& id) const
++    bool Wallet::CollectOfflineTransactions(std::set<std::string>& hexIds) const
 +    {
 +        auto db = std::dynamic_pointer_cast<WalletDB>(m_WalletDB);
-+        if (!db) return true;
++        if (!db) return false;
 +        try
 +        {
-+            bool offline = false;
-+            const auto hex = to_hex(id.data(), id.size());
 +            for (const auto& entry : db->getBlobsByPrefix("beam.sdk.kmp.send.v"))
 +            {
 +                const auto j = nlohmann::json::parse(entry.second.begin(), entry.second.end());
 +                if (entry.first.find("beam.sdk.kmp.send.v1.") != 0 ||
-+                    j.find("txId") == j.end() || !j.at("txId").is_string()) return true;
++                    j.find("txId") == j.end() || !j.at("txId").is_string()) return false;
 +                if (j.find("version") == j.end())
 +                {
-+                    if (j.find("mode") != j.end()) return true;
++                    if (j.find("mode") != j.end()) return false;
 +                    const auto state = j.at("state").get<std::string>();
-+                    if (state != "Prepared" && state != "Committing" && state != "Submitted") return true;
++                    if (state != "Prepared" && state != "Committing" && state != "Submitted") return false;
 +                    continue; // unchanged legacy online record
 +                }
-+                if (j.at("version") != 2 || j.at("mode") != "Offline") return true;
++                if (j.at("version") != 2 || j.at("mode") != "Offline") return false;
 +                const auto state = j.at("state").get<std::string>();
-+                if (state != "Signing" && state != "Signed" && state != "Exported") return true;
-+                if (j.at("txId") == hex) offline = true;
++                if (state != "Signing" && state != "Signed" && state != "Exported") return false;
++                hexIds.insert(j.at("txId").get<std::string>());
 +            }
-+            return offline;
++            return true;
 +        }
-+        catch (...) { return true; } // no parser diagnostics / receiver material
++        catch (...) { return false; } // no parser diagnostics / receiver material
++    }
++
++    bool Wallet::IsOfflineTransaction(const TxID& id) const
++    {
++        std::set<std::string> offline;
++        return !CollectOfflineTransactions(offline) || offline.count(to_hex(id.data(), id.size()));
 +    }
 +
 +    bool Wallet::IsOfflineSigningIntent(const TxID& id) const
@@ -198,11 +204,18 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
 +
 +    void Wallet::RequestOfflineKernelProofs()
 +    {
-+        if (m_ExecutionMode == ExecutionMode::Offline || !IsRecoveryAdmissionOpen()) return;
++        // One round per wallet instance, i.e. per SDK start; rows already observed are not asked again.
++        if (m_OfflineKernelProofsRequested || m_ExecutionMode == ExecutionMode::Offline || !IsRecoveryAdmissionOpen()) return;
++        m_OfflineKernelProofsRequested = true;
++        std::set<std::string> offline;
++        const bool known = CollectOfflineTransactions(offline); // unreadable inventory: treat every row as offline
 +        for (const auto& tx : m_WalletDB->getTxHistory(TxType::ALL))
 +        {
 +            Merkle::Hash kernel;
-+            if (!IsOfflineTransaction(tx.m_txId) || !tx.GetParameter(TxParameterID::KernelID, kernel)) continue;
++            Height observed = 0;
++            tx.GetParameter(TxParameterID::KernelProofHeight, observed);
++            if ((known && !offline.count(to_hex(tx.m_txId.data(), tx.m_txId.size()))) || observed ||
++                !tx.GetParameter(TxParameterID::KernelID, kernel)) continue;
 +            MyRequestKernel::Ptr request(new MyRequestKernel);
 +            request->m_TxID = tx.m_txId;
 +            request->m_Msg.m_ID = kernel;
@@ -251,7 +264,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          if (!m_RecoveryPolicy) return true;
          auto it = m_ActiveTransactions.find(tx.GetTxID());
          return m_RecoveryAdmission && tx.InstanceEpoch() == m_TransactionEpoch &&
-@@ -2176,6 +2296,7 @@
+@@ -2176,6 +2307,7 @@
  
      bool Wallet::AllowRequest(const Request& request) const
      {
@@ -259,31 +272,36 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          if (!m_RecoveryPolicy || m_RecoveryAdmission) return true;
          if (request.m_RecoveryProof && request.get_Type() == Request::Type::Kernel)
              return m_RecoveryQuorumConfigured && m_RecoveryLiveTip && !m_RecoveryFailure;
-@@ -2378,7 +2499,11 @@
+@@ -2375,10 +2507,15 @@
+         {
+             for (const auto& proof : m_RecoveryProofHeights)
+             {
++                const bool offline = IsOfflineTransaction(proof.first); // offline rows drive SDK history visibility
                  if (proof.second)
-                     storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, proof.second, false);
+-                    storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, proof.second, false);
++                    storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, proof.second, offline);
                  else
 +                {
-+                    if (IsOfflineTransaction(proof.first))
-+                        storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, Height(0), false);
++                    if (offline)
++                        storage::setTxParameter(*db, proof.first, TxParameterID::KernelProofHeight, Height(0), true);
                      storage::setTxParameter(*db, proof.first, TxParameterID::KernelUnconfirmedHeight, tip.get_Height(), false);
 +                }
              }
              if (m_RecognitionRecovery.m_Phase == RecognitionRecovery::Replay)
              {
-@@ -3001,6 +3126,11 @@
+@@ -3001,6 +3138,11 @@
          auto txs = m_WalletDB->getTxHistory(TxType::ALL); // get list of ALL transactions
          for (auto& tx : txs)
          {
 +            if (IsOfflineTransaction(tx.m_txId))
 +            {
-+                storage::setTxParameter(*m_WalletDB, tx.m_txId, TxParameterID::KernelProofHeight, Height(0), false);
++                storage::setTxParameter(*m_WalletDB, tx.m_txId, TxParameterID::KernelProofHeight, Height(0), true);
 +                continue;
 +            }
              // For all transactions that are not currently in the 'active' tx list
              if (m_ActiveTransactions.find(tx.m_txId) == m_ActiveTransactions.end())
              {
-@@ -3182,6 +3312,7 @@
+@@ -3182,6 +3324,7 @@
          RequestBodies();
          RequestEvents();
          RequestStateSummary();
@@ -291,7 +309,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
  
          for (auto& tx : m_NextTipTransactionToUpdate)
          {
-@@ -3215,6 +3346,7 @@
+@@ -3215,6 +3358,7 @@
          m_RecoveryLiveTip = true;
          BEAM_LOG_INFO() << "Tip has not been changed";
  
@@ -299,7 +317,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          RequestBodies();
  
          CheckSyncDone();
-@@ -3463,6 +3595,7 @@
+@@ -3463,6 +3607,7 @@
  
      void Wallet::OnTransactionMsg(const WalletID& myID, const SetTxParameter& msg)
      {
@@ -307,7 +325,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          //
          // Extend Auto addresses
          //
-@@ -3602,6 +3735,7 @@
+@@ -3602,6 +3747,7 @@
  
      BaseTransaction::Ptr Wallet::ConstructTransaction(const TxID& id, TxType type)
      {
@@ -315,7 +333,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          auto it = m_TxCreators.find(type);
          if (it == m_TxCreators.end())
          {
-@@ -3614,6 +3748,7 @@
+@@ -3614,6 +3760,7 @@
  
      BaseTransaction::Ptr Wallet::ConstructTransactionFromParameters(const TxParameters& parameters)
      {
@@ -323,7 +341,7 @@ diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
          auto type = parameters.GetParameter<TxType>(TxParameterID::TransactionType);
          if (!type)
          {
-@@ -3721,6 +3856,8 @@
+@@ -3721,6 +3868,8 @@
  
      void Wallet::RestoreTransactionFromShieldedCoin(ShieldedCoin& coin)
      {

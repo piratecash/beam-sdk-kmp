@@ -723,14 +723,16 @@ private data class SendOperationDto(
     val serializedHash: String = "",
     val mainKernelId: String = "",
     val observedProofHeight: Long = 0,
+    val createdAtEpochSeconds: Long? = null,
 )
 
-private fun String.toSendOperations(): List<BeamSendOperation> =
+internal fun String.toSendOperations(): List<BeamSendOperation> =
     json.decodeFromString<List<SendOperationDto>>(this).map {
         BeamSendOperation(it.operationId, it.transactionId, it.requestHash, it.amount, it.fee, it.resolution.toDomain(),
             BeamSendDeliveryMode.valueOf(it.deliveryMode), it.offlineState?.let(BeamOfflineSendState::valueOf),
             it.contextId.takeIf(String::isNotEmpty), it.rules.takeIf(String::isNotEmpty),
-            it.serializedHash.takeIf(String::isNotEmpty), it.mainKernelId.takeIf(String::isNotEmpty), it.observedProofHeight)
+            it.serializedHash.takeIf(String::isNotEmpty), it.mainKernelId.takeIf(String::isNotEmpty), it.observedProofHeight,
+            it.createdAtEpochSeconds)
     }
 
 private fun ResolutionDto.toDomain(): BeamSendResolution {
