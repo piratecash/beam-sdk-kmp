@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "29f6ce6b8dc7583722870fa789984c9d62b1326b",
+  "testedCommit": "87f9ef6d6fa9c813d224b8a0e361a44867d94a90",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-  "smokeScope": "CI SDK/native artifacts from testedCommit (run 35244272419: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a af1829724b16c458e577505bf3eea2f3a08951965f5d0c901bf8e7079e7691ef, armeabi-v7a bc4762486ce229552f7163b6dcf8212077e35cd226461c444056bb6fbbcf0784; both .so contain the new literal \"Beam recovery stalled: fewer than two nodes qualify for the quorum\", which the v0.1.4 artifacts of run 35194786362 do not, so the patch-0018 build is distinguishable even though coreCommit and nativeVersion are unchanged) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token, stateless token parser, unfunded offline quote rejected; no network start or send. The two ABIs used separate runIds (35244272419 and 35244272419-v7a) because the harness namespaces its phase state by runId alone, so a shared runId would start the second ABI at the reopen phase. Network behaviour is covered separately, off-device: MainnetSnapshotRestoreLiveTest ran against a locally built dylib of the same source at 2026-09-17T16:19:42Z with the quorum off and reached Ready on mainnet in 29s at height 4041199 with quorumRequests=0 and no failure; the snapshot landed at the tip, so that run observed no separate body-scan advances and the assertion was satisfied by Ready, not by an advance count. The same run wrote logs/beam_26_09_17_23_19_43.log, whose 10 lines are all Info even though the configured level was Debug, confirming that a Release-built native compiles BEAM_LOG_DEBUG to a stub. The deadlock this release fixes was reproduced on the Pixel 6 with the previous v0.1.4 build the same day: currentHeight frozen at 4040837 from 17:25 to 17:57 local while the tip advanced 4040843 -> 4040879 and syncTotal grew 13 -> 76. Whether the fix clears that on the device is proven only by the P.CASH build that consumes this release, not by this harness.",
+  "smokeScope": "CI SDK/native artifacts from testedCommit (run 35432534541: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a d559ed318ead8fca68fe1da5a3462abdf3dcf21f2523c1e098ca963525633424, armeabi-v7a 8b588b4133d9f96bae42b8cac85050295ed6d72f3e79f10d596666b3d595f9cd) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen (open() now runs the offline leftover sweep on every open), PublicOffline receive token, stateless token parser, unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (35432534541 and 35432534541-v7a) because the harness namespaces its phase state by runId alone. The harness has no funds, so it does not sign offline: releasing inputs at signing, the Signing leftover sweep, hiding offline rows until their kernel is observed, the one-per-start() kernel round, change recovery, a losing double spend and a reorg are covered off-device by the native host tests (offline_signer_test, offline_history_test, send_admission_test) and the Kotlin JNI fixture tests on the same source. start() itself is not exercised hermetically because it connects to Beam's default peers. The previous main run 35432296215 on 348224d failed only because patch 0016 had lost the CRLF context of base_transaction.cpp; 87f9ef6 restores those bytes and the patched Core sources are identical to the ones the host tests compiled, apart from line endings.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
@@ -10,7 +10,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-17T16:14:55Z"
+      "testedAtUtc": "2026-09-19T09:03:30Z"
     },
     "armeabi-v7a": {
       "status": "passed",
@@ -18,7 +18,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-17T16:19:27Z"
+      "testedAtUtc": "2026-09-19T09:03:51Z"
     }
   }
 }
