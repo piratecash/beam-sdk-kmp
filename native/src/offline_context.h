@@ -4,6 +4,7 @@
 #include "wallet/core/base_tx_builder.h"
 #include <map>
 #include <atomic>
+#include <deque>
 
 namespace beam::sdk {
 
@@ -17,6 +18,11 @@ public:
         std::string contextId;
         Height height = 0;
         TxoID shieldedCount = 0;
+        // Diagnostics only: why this state was reported and how far preparation got.
+        std::string reason;
+        bool boundaryDone = false, awaitingSecondPeer = false;
+        size_t downloadsDone = 0, downloadsTotal = 0, proofsDone = 0, proofsTotal = 0;
+        bool operator==(const State&) const;
     };
     using Range = std::pair<TxoID, uint32_t>;
     using Changed = std::function<void(const State&)>;
@@ -27,7 +33,8 @@ public:
     ~OfflineContext();
     void load();
     void prepare(proto::FlyClient::INetwork&);
-    void invalidate();
+    void invalidate(std::string reason = "invalidated");
+    void note(std::string reason); // a fact about the current phase, e.g. a skipped prepare
     void requestStop() { stopRequested_.store(true); } // thread-safe dispatch fence, before join
     void resume() { stopRequested_.store(false); } // owner acquired, before restarting reactor
     void stop();
@@ -116,13 +123,14 @@ private:
 
     void OnComplete(Request&) override;
     void onShieldedCoinsChanged(wallet::ChangeAction, const std::vector<wallet::ShieldedCoin>&) override {
-        invalidate();
+        invalidate("shielded-coins-changed");
     }
     void onSystemStateChanged(const HeightHash&) override;
     void next();
     void cancel();
     void publish();
-    void report(Phase);
+    void report(Phase, std::string reason);
+    void notify(std::string reason);
     bool matchesDatabase(const Record&) const;
     bool complete(const Record&, bool currentCoins = true) const;
     bool reusable() const;
@@ -132,5 +140,18 @@ private:
     static std::string identity(const Record&);
     static bool validProof(const Record&, const OwnProof&);
     static bool build(const Record&, const std::vector<Range>& sorted, Snapshot&);
+};
+
+// Bounded, sequenced log of reported states for diagnostics. Not synchronised: the owner serialises
+// access. A state equal to the latest entry is not repeated.
+class OfflineContextEvents final {
+public:
+    static constexpr size_t Capacity = 64;
+    struct Event { uint64_t seq; OfflineContext::State state; };
+    void add(const OfflineContext::State&);
+    const std::deque<Event>& events() const { return events_; }
+private:
+    uint64_t seq_ = 0;
+    std::deque<Event> events_;
 };
 } // namespace beam::sdk

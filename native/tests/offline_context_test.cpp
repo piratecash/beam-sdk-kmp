@@ -223,13 +223,29 @@ void contextFixture(const std::filesystem::path& dir) {
         Wallet wallet(db);
         synced(*db, node);
         ContextNetwork network(wallet, node);
-        Context context(db, 0, {});
+        beam::sdk::OfflineContextEvents log;
+        Context context(db, 0, [&](const Context::State& state) { log.add(state); });
         context.load();
         require(context.state().phase == Context::Phase::Unavailable, "new wallet has context");
         context.prepare(network);
         require(context.state().phase == Context::Phase::Preparing, "normal sync did not prepare");
         network.finish();
         require(context.state().phase == Context::Phase::Ready, "valid quorum did not publish");
+        const auto& events = log.events();
+        require(events.size() >= 4 && events.front().state.reason == "no-record" &&
+            events[1].state.phase == Context::Phase::Preparing && events.back().state.reason == "published",
+            "context events omitted a transition or its reason");
+        const auto& last = events[events.size() - 2].state;
+        require(last.reason == "progress" && last.boundaryDone && last.downloadsTotal &&
+            last.downloadsDone == last.downloadsTotal && last.proofsDone == last.proofsTotal && !last.awaitingSecondPeer,
+            "final progress event did not reach its totals");
+        bool awaiting = false;
+        for (size_t i = 0; i < events.size(); ++i) {
+            require(events[i].seq == events.front().seq + i, "context event sequence has a gap");
+            awaiting |= events[i].state.awaitingSecondPeer;
+        }
+        require(awaiting, "first quorum response was not reported");
+        std::cout << "CONTEXT_EVENTS_OK " << events.size() << '\n';
         contextId = context.state().contextId;
         initialTraffic = network.traffic;
         require(network.listItems == 2 * node.m_Extra.m_ShieldedOutputs,
@@ -344,7 +360,8 @@ void contextFixture(const std::filesystem::path& dir) {
             HeightHash forkId;
             fork.get_ID(forkId);
             db->setSystemStateID(forkId);
-            require(context.state().phase == Context::Phase::Invalidated, "same-height reorg not invalidated");
+            require(context.state().phase == Context::Phase::Invalidated && context.state().reason == "tip-changed",
+                "same-height reorg not invalidated");
             Context reopened(db, 0, {});
             reopened.load();
             require(reopened.state().phase == Context::Phase::Invalidated, "same-height reorg loaded cache");
@@ -564,8 +581,8 @@ void contextFixture(const std::filesystem::path& dir) {
         });
         owner = &reentrant;
         reentrant.prepare(network);
-        require(!network.held && reentrant.state().phase == Context::Phase::Unavailable,
-            "Preparing observer stop dispatched a request after drain");
+        require(!network.held && reentrant.state().phase == Context::Phase::Unavailable &&
+            reentrant.state().reason == "stopped", "Preparing observer stop dispatched a request after drain");
     }
     {
         auto empty = createDb(dir / "empty.db", 900);
@@ -582,24 +599,38 @@ void contextFixture(const std::filesystem::path& dir) {
         unknown.m_TxoID = ShieldedCoin::kTxoInvalidID;
         unknown.m_confirmHeight = MaxHeight;
         empty->saveShieldedCoin(unknown);
-        require(context.state().phase == Context::Phase::Invalidated, "coin mutation retained readiness");
+        require(context.state().phase == Context::Phase::Invalidated &&
+            context.state().reason == "shielded-coins-changed", "coin mutation retained readiness");
         context.prepare(network);
-        require(context.state().phase == Context::Phase::Invalidated && !network.held,
+        require(context.state().phase == Context::Phase::Invalidated && !network.held &&
+            context.state().reason.rfind("prepare: offline_context.cpp:", 0) == 0,
             "unknown shielded data was treated as empty coverage");
         empty->clearShieldedCoins();
         context.load();
         require(context.state().phase == Context::Phase::Ready, "valid old empty coverage was lost");
         empty->get_History().DeleteFrom(node.m_Cursor.m_hh.m_Height);
         context.load();
-        require(context.state().phase == Context::Phase::Invalidated, "evicted checkpoint retained readiness");
+        require(context.state().phase == Context::Phase::Invalidated &&
+            context.state().reason.rfind("load: offline_context.cpp:", 0) == 0, "evicted checkpoint retained readiness");
         std::cout << "CONTEXT_UNKNOWN_AND_EVICTION_REJECTED\n";
     }
     realistic(dir, funds, node.m_Cursor.m_Full, *db);
 }
 }
 
+void eventsBound() {
+    beam::sdk::OfflineContextEvents log;
+    Context::State state;
+    for (int i = 0; i < 70; ++i) { state.reason = std::to_string(i); log.add(state); log.add(state); }
+    const auto& events = log.events();
+    require(events.size() == beam::sdk::OfflineContextEvents::Capacity && events.front().seq == 7 &&
+        events.back().seq == 70 && events.back().state.reason == "69", "context event log bound or dedup broken");
+    std::cout << "CONTEXT_EVENTS_BOUND_OK\n";
+}
+
 int main() {
     try {
+        eventsBound();
         auto dir = std::filesystem::temp_directory_path() / ("beam-context-test-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         require(std::filesystem::create_directory(dir), "fixture directory exists");

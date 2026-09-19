@@ -134,4 +134,50 @@ class SnapshotDtoTest {
         assertTrue(snapshot.balance.isAuthoritative)
         assertTrue(snapshot.balance.isLoaded)
     }
+
+    @Test
+    fun `offline context events decode and older payloads default to none`() {
+        val dto = json.decodeFromString<SnapshotDto>(
+            """
+            {
+              "phase": "Ready",
+              "offlineSigning": {
+                "phase": "Preparing", "contextId": "", "height": 0, "shieldedCount": 0,
+                "events": [{
+                  "seq": 3, "phase": "Preparing", "reason": "progress", "height": 0, "shieldedCount": 0,
+                  "boundaryDone": true, "downloadsDone": 1, "downloadsTotal": 2, "proofsDone": 0,
+                  "proofsTotal": 1, "awaitingSecondPeer": true
+                }]
+              }
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(
+            "offline context seq=3 phase=Preparing reason=progress height=0 shielded=0 boundary=true" +
+                " downloads=1/2 proofs=0/1 awaitingPeer=true",
+            dto.offlineSigning.events.single().logLine(),
+        )
+        val older = json.decodeFromString<SnapshotDto>("""{ "phase": "Ready", "offlineSigning": { "phase": "Ready" } }""")
+        assertTrue(older.offlineSigning.events.isEmpty())
+    }
+
+    @Test
+    fun `offline context lines advance the cursor, report drops and never rewind`() {
+        fun events(vararg seqs: Long) = seqs.map { OfflineSigningEventDto(seq = it, reason = "r$it") }
+
+        val (first, firstLines) = offlineEventLines(events(1, 2), lastSeq = 0)
+        assertEquals(2, first)
+        assertEquals(events(1, 2).map { it.logLine() }, firstLines)
+
+        assertEquals(2L to emptyList(), offlineEventLines(events(1, 2), lastSeq = 2))
+        assertEquals(2L to emptyList(), offlineEventLines(emptyList(), lastSeq = 2))
+
+        val (dropped, droppedLines) = offlineEventLines(events(6, 7), lastSeq = 2)
+        assertEquals(7, dropped)
+        assertEquals(listOf("offline context events dropped=3") + events(6, 7).map { it.logLine() }, droppedLines)
+
+        // A snapshot taken before a concurrent, already logged one must not re-emit its events.
+        assertEquals(7L to emptyList(), offlineEventLines(events(4, 5), lastSeq = 7))
+    }
 }

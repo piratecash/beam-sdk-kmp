@@ -10,9 +10,23 @@ template<class T> ByteBuffer bytes(const T& value) { return wallet::toByteBuffer
 bool equal(const Block::SystemState::Full& a, const Block::SystemState::Full& b) {
     return a == b;
 }
-void require(bool value) {
-    if (!value) throw std::runtime_error("Offline signing context is incomplete or inconsistent");
+// The failing line identifies which precondition withheld or dropped the context.
+void require(bool value, unsigned line = __builtin_LINE()) {
+    if (!value) throw std::runtime_error("offline_context.cpp:" + std::to_string(line));
 }
+}
+
+bool OfflineContext::State::operator==(const State& o) const {
+    return phase == o.phase && contextId == o.contextId && height == o.height &&
+        shieldedCount == o.shieldedCount && reason == o.reason && boundaryDone == o.boundaryDone &&
+        awaitingSecondPeer == o.awaitingSecondPeer && downloadsDone == o.downloadsDone &&
+        downloadsTotal == o.downloadsTotal && proofsDone == o.proofsDone && proofsTotal == o.proofsTotal;
+}
+
+void OfflineContextEvents::add(const OfflineContext::State& state) {
+    if (!events_.empty() && events_.back().state == state) return;
+    events_.push_back({++seq_, state});
+    if (events_.size() > Capacity) events_.pop_front();
 }
 
 OfflineContext::OfflineContext(std::shared_ptr<wallet::WalletDB> db, int network, Changed changed)
@@ -30,7 +44,7 @@ void OfflineContext::cancel() {
     downloads_.clear();
     endpoints_.clear();
 }
-void OfflineContext::report(Phase phase) {
+void OfflineContext::report(Phase phase, std::string reason) {
     state_ = {};
     state_.phase = phase;
     if (phase == Phase::Ready) {
@@ -38,6 +52,20 @@ void OfflineContext::report(Phase phase) {
         state_.height = saved_.checkpoint.get_Height();
         state_.shieldedCount = saved_.count;
     }
+    notify(std::move(reason));
+}
+void OfflineContext::note(std::string reason) {
+    if (!closed_) notify(std::move(reason));
+}
+void OfflineContext::notify(std::string reason) {
+    state_.reason = std::move(reason);
+    const bool preparing = state_.phase == Phase::Preparing;
+    state_.boundaryDone = preparing && boundaryDone_;
+    state_.awaitingSecondPeer = preparing && firstPeer_ != io::Address();
+    state_.downloadsDone = preparing ? windowIndex_ : 0;
+    state_.downloadsTotal = preparing ? downloads_.size() : 0;
+    state_.proofsDone = preparing ? proofIndex_ : 0;
+    state_.proofsTotal = preparing ? pending_.proofs.size() : 0;
     if (changed_) changed_(state_);
 }
 void OfflineContext::onSystemStateChanged(const HeightHash& id) {
@@ -46,17 +74,17 @@ void OfflineContext::onSystemStateChanged(const HeightHash& id) {
     if (!record) return;
     HeightHash expected;
     record->checkpoint.get_ID(expected);
-    if (expected != id) invalidate();
+    if (expected != id) invalidate("tip-changed");
 }
-void OfflineContext::invalidate() {
+void OfflineContext::invalidate(std::string reason) {
     cancel();
-    if (!closed_) report(Phase::Invalidated);
+    if (!closed_) report(Phase::Invalidated, std::move(reason));
 }
 void OfflineContext::stop() {
     requestStop();
     cancel();
     // A completed durable context survives a disconnected/stopped owner.
-    if (state_.phase == Phase::Preparing) report(Phase::Unavailable);
+    if (state_.phase == Phase::Preparing) report(Phase::Unavailable, "stopped");
 }
 void OfflineContext::close() {
     stop();
@@ -294,7 +322,7 @@ void OfflineContext::load() {
     saved_ = {};
     try {
         ByteBuffer data;
-        if (!db_->getBlob(Key, data)) { report(Phase::Unavailable); return; }
+        if (!db_->getBlob(Key, data)) { report(Phase::Unavailable, "no-record"); return; }
         require(data.size() <= MaxBytes);
         Deserializer d;
         d.reset(data);
@@ -306,12 +334,13 @@ void OfflineContext::load() {
         saved_ = std::move(record);
         require(matchesDatabase(saved_)); // stale record may seed an ancestry-checked refresh only
         require(complete(saved_));
-        report(Phase::Ready);
-    } catch (const std::exception&) { report(Phase::Invalidated); }
+        report(Phase::Ready, "loaded");
+    } catch (const std::exception& e) { report(Phase::Invalidated, std::string("load: ") + e.what()); }
 }
 
 void OfflineContext::prepare(proto::FlyClient::INetwork& transport) {
-    if (closed_ || stopRequested_.load() || state_.phase == Phase::Preparing) return;
+    if (closed_ || state_.phase == Phase::Preparing) return;
+    if (stopRequested_.load()) { note("prepare skipped: stop requested"); return; }
     try {
         if (state_.phase == Phase::Ready && matchesDatabase(saved_) && complete(saved_)) return;
         cancel();
@@ -338,9 +367,9 @@ void OfflineContext::prepare(proto::FlyClient::INetwork& transport) {
         transport_ = &transport;
         boundaryDone_ = false;
         windowIndex_ = proofIndex_ = 0;
-        report(Phase::Preparing);
+        report(Phase::Preparing, "prepare");
         next();
-    } catch (const std::exception&) { invalidate(); }
+    } catch (const std::exception& e) { invalidate(std::string("prepare: ") + e.what()); }
 }
 
 void OfflineContext::next() {
@@ -426,8 +455,9 @@ void OfflineContext::OnComplete(Request& request) {
             candidate_.clear();
         }
         request_.reset();
+        note("progress");
         next();
-    } catch (const std::exception&) { invalidate(); }
+    } catch (const std::exception& e) { invalidate(std::string("response: ") + e.what()); }
 }
 
 void OfflineContext::publish() {
@@ -447,7 +477,7 @@ void OfflineContext::publish() {
     } catch (...) { db_->RollbackNow(false); throw; }
     saved_ = std::move(pending_);
     transport_ = nullptr;
-    report(Phase::Ready);
+    report(Phase::Ready, "published");
 }
 
 bool OfflineContext::build(const Record& record, const std::vector<Range>& sorted, Snapshot& out) {

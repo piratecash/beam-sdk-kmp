@@ -551,6 +551,30 @@ void signerCases(const std::filesystem::path& dir, bool production, bool histori
         std::cout << "OFFLINE_SIGNER_PROCESS_KILL_OK " << point << std::endl;
     }
 #endif
+    {
+        // WalletClient's run_ex stop callback captures its own frame; signOffline reuses the session
+        // reactor after that owner returned, so the callback must not survive it (0.2.0 SIGSEGV).
+        OfflineSignerFixture f(dir / "finished-owner", rules, node, funds, Inputs::Ordinary);
+        auto stops = std::make_shared<int>(0);
+        auto stopper = io::Timer::create(*f.retainedReactor);
+        stopper->start(0, false, [] { io::Reactor::get_Current().stop(); });
+        f.retainedReactor->run_ex([stops] { ++*stops; });
+        require(*stops == 1, "owner stop callback did not run exactly once");
+        f.session.initializeOfflineContext(); // the Session observer records context events
+        auto receiver = chooseRecipient(dir, ++scenario + 1000, TxAddressType::PublicOffline);
+        auto q = f.quote(receiver.token, 20'000'000);
+        auto ran = std::make_shared<bool>(false);
+        auto probe = io::Timer::create(*f.retainedReactor);
+        probe->start(0, false, [ran] { *ran = true; });
+        require(f.sign("finished-owner", receiver.token, q).at("state") == "Signed", "sign after a finished owner failed");
+        require(*ran, "signOffline did not run the session reactor");
+        require(*stops == 1, "signOffline re-invoked a finished owner's stop callback");
+        const auto events = Json::parse(f.session.snapshotJson()).at("offlineSigning").at("events");
+        require(std::any_of(events.begin(), events.end(), [](const Json& e) {
+            return e.at("phase") == "Ready" && e.at("reason") == "loaded" && e.at("seq") > 0 && e.count("awaitingSecondPeer");
+        }), "snapshot omitted offline context events");
+        std::cout << "OFFLINE_SIGNER_FINISHED_OWNER_OK" << std::endl;
+    }
     for (bool maxPrivacy : {false, true})
     for (const std::string point : {"offline-abort-record", "offline-aborted"}) {
         const auto name = std::string(maxPrivacy ? "self-max-" : "self-offline-") + point;

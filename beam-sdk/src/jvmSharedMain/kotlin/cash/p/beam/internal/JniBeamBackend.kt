@@ -64,6 +64,8 @@ private class JniBeamBackend : BeamBackend {
     private var lastLoggedSyncDone: Long? = null
     private var lastLoggedSyncTotal: Long? = null
     private var lastLoggedQuorumRequests: Long? = null
+    private val offlineEventLock = Any()
+    private var lastOfflineEventSeq = 0L
 
     override val snapshot: StateFlow<BackendSnapshot> = mutableSnapshot
 
@@ -202,7 +204,8 @@ private class JniBeamBackend : BeamBackend {
                 pollJob = null
                 nativeCall { BeamNative.stop(requireHandle()) }
                 val stopped = nativeCall {
-                    json.decodeFromString<SnapshotDto>(BeamNative.snapshot(requireHandle())).toDomain()
+                    json.decodeFromString<SnapshotDto>(BeamNative.snapshot(requireHandle()))
+                        .also(::logOfflineEvents).toDomain()
                 }
                 mutableSnapshot.value = stopped.copy(
                     phase = BackendPhase.Stopped,
@@ -223,12 +226,14 @@ private class JniBeamBackend : BeamBackend {
                 pollJob = null
                 val closingHandle = handle
                 handle = NO_HANDLE
+                drainOfflineEvents(closingHandle)
                 try {
                     nativeCall { BeamNative.close(closingHandle) }
                 } finally {
                     // Keep a downloaded snapshot until native import reaches a success phase.
                     // The DB persists its path, so an interrupted restore can resume after reopen.
                     snapshotRestoreState = SnapshotRestoreState()
+                    synchronized(offlineEventLock) { lastOfflineEventSeq = 0 } // the next native session restarts seq
                     config = null
                     mutableSnapshot.value = BackendSnapshot()
                     scope.cancel()
@@ -255,7 +260,7 @@ private class JniBeamBackend : BeamBackend {
         ).map(TransactionDto::toDomain)
     }
 
-    override suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote = ioCall {
+    override suspend fun quoteSend(request: BeamQuoteRequest): BeamSendQuote = offlineContextCall(request) {
         json.decodeFromString<QuoteDto>(BeamNative.quoteSend(requireHandle(), request.receiverToken,
             (request.amount as? BeamSendAmount.Exact)?.amount ?: 0, request.amount == BeamSendAmount.Max,
             request.comment, (request.context as? BeamSendContext.Offline)?.contextId.orEmpty())).toDomain()
@@ -263,7 +268,7 @@ private class JniBeamBackend : BeamBackend {
 
     override suspend fun signOffline(
         operationId: String, request: BeamQuoteRequest, quoteVersion: String,
-    ): BeamOfflineSignResult = ioCall {
+    ): BeamOfflineSignResult = offlineContextCall(request) {
         val dto = json.decodeFromString<OfflineSignDto>(BeamNative.signOffline(requireHandle(), operationId,
             request.receiverToken, (request.amount as? BeamSendAmount.Exact)?.amount ?: 0,
             request.amount == BeamSendAmount.Max, request.comment,
@@ -331,6 +336,7 @@ private class JniBeamBackend : BeamBackend {
                     BeamNative.snapshot(requireHandle()),
                 )
                 mutableSnapshot.value = dto.toDomain()
+                logOfflineEvents(dto)
                 if (
                     lastLoggedPhase != dto.phase ||
                     lastLoggedCurrentHeight != dto.currentHeight ||
@@ -371,6 +377,30 @@ private class JniBeamBackend : BeamBackend {
 
     private suspend fun <T> ioCall(block: () -> T): T = withContext(Dispatchers.IO) {
         nativeCall(block)
+    }
+
+    // An offline quote or sign reloads the context, possibly while stopped with the poll cancelled.
+    private suspend fun <T> offlineContextCall(request: BeamQuoteRequest, block: () -> T): T = ioCall {
+        try {
+            block()
+        } finally {
+            if (request.context is BeamSendContext.Offline) handle.takeUnless { it == NO_HANDLE }?.let(::drainOfflineEvents)
+        }
+    }
+
+    private fun drainOfflineEvents(nativeHandle: Long) {
+        try {
+            logOfflineEvents(json.decodeFromString<SnapshotDto>(BeamNative.snapshot(nativeHandle)))
+        } catch (error: Throwable) {
+            // Best effort before close; the decode message may quote raw snapshot JSON, so log only the type.
+            logger.w { "offline context events unavailable: ${error::class.simpleName}" }
+        }
+    }
+
+    private fun logOfflineEvents(dto: SnapshotDto) = synchronized(offlineEventLock) {
+        val (seq, lines) = offlineEventLines(dto.offlineSigning.events, lastOfflineEventSeq)
+        lastOfflineEventSeq = seq
+        lines.forEach { line -> logger.d { line } }
     }
 
     private fun ensureLoaded() {
@@ -758,6 +788,7 @@ internal data class OfflineSigningDto(
     val contextId: String = "",
     val height: Long = 0,
     val shieldedCount: Long = 0,
+    val events: List<OfflineSigningEventDto> = emptyList(),
 ) {
     fun toDomain(): BeamOfflineSigningState = when (phase) {
         "Preparing" -> BeamOfflineSigningState.Preparing
@@ -767,6 +798,38 @@ internal data class OfflineSigningDto(
         }
         "Invalidated" -> BeamOfflineSigningState.Invalidated
         else -> BeamOfflineSigningState.Unavailable
+    }
+}
+
+// Diagnostic only: one offline signing context transition, logged and never exposed.
+@Serializable
+internal data class OfflineSigningEventDto(
+    val seq: Long,
+    val phase: String = "Unavailable",
+    val reason: String = "",
+    val height: Long = 0,
+    val shieldedCount: Long = 0,
+    val boundaryDone: Boolean = false,
+    val downloadsDone: Long = 0,
+    val downloadsTotal: Long = 0,
+    val proofsDone: Long = 0,
+    val proofsTotal: Long = 0,
+    val awaitingSecondPeer: Boolean = false,
+) {
+    fun logLine(): String =
+        "offline context seq=$seq phase=$phase reason=$reason height=$height shielded=$shieldedCount" +
+            " boundary=$boundaryDone downloads=$downloadsDone/$downloadsTotal proofs=$proofsDone/$proofsTotal" +
+            " awaitingPeer=$awaitingSecondPeer"
+}
+
+/** Lines for the events newer than [lastSeq] and the new cursor; an older snapshot never rewinds it. */
+internal fun offlineEventLines(events: List<OfflineSigningEventDto>, lastSeq: Long): Pair<Long, List<String>> {
+    val fresh = events.filter { it.seq > lastSeq }.sortedBy { it.seq }
+    if (fresh.isEmpty()) return lastSeq to emptyList()
+    val dropped = fresh.first().seq - lastSeq - 1
+    return fresh.last().seq to buildList {
+        if (dropped > 0) add("offline context events dropped=$dropped")
+        fresh.mapTo(this) { it.logLine() }
     }
 }
 

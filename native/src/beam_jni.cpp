@@ -831,6 +831,7 @@ public:
                 // This independent snapshot lock avoids re-entering that lifecycle mutex.
                 std::lock_guard<std::mutex> lock(offlineStateMutex_);
                 offlineState_ = state;
+                offlineEvents_.add(state);
             });
         offlineContext_->load();
     }
@@ -991,11 +992,15 @@ public:
                         auto wallet = contextWallet.lock();
                         auto network = contextNetwork.lock();
                         if (!cache) return;
-                        if (!synced) cache->invalidate();
+                        if (!synced) cache->invalidate("not-synced");
                         else if (wallet && network && wallet->IsRecoveryAdmissionOpen()) cache->prepare(*network);
+                        else cache->note("prepare skipped: owner gone");
                     };
-                    if (wallet->IsRecoveryAdmissionOpen() && configuredClient->isSynced())
-                        self->offlineContext_->prepare(*network);
+                    const bool admission = wallet->IsRecoveryAdmissionOpen();
+                    const bool synced = configuredClient->isSynced();
+                    if (admission && synced) self->offlineContext_->prepare(*network);
+                    else self->offlineContext_->note(std::string("start: prepare skipped (synced=") +
+                        (synced ? "true" : "false") + " admission=" + (admission ? "true" : "false") + ")");
                     std::weak_ptr<Session> weak = self;
                     wallet->SetBodyQuorumFailureHandler([weak](const std::string& message) {
                         if (auto session = weak.lock()) session->onQuorumError(message);
@@ -1130,19 +1135,32 @@ public:
         };
         using ContextPhase = beam::sdk::OfflineContext::Phase;
         beam::sdk::OfflineContext::State context;
+        std::deque<beam::sdk::OfflineContextEvents::Event> contextEvents;
         {
             std::lock_guard<std::mutex> contextLock(offlineStateMutex_);
             context = offlineState_;
+            contextEvents = offlineEvents_.events();
         }
-        const char* contextPhase = "Unavailable";
-        switch (context.phase) {
-            case ContextPhase::Unavailable: break;
-            case ContextPhase::Preparing: contextPhase = "Preparing"; break;
-            case ContextPhase::Ready: contextPhase = "Ready"; break;
-            case ContextPhase::Invalidated: contextPhase = "Invalidated"; break;
+        const auto contextPhase = [](ContextPhase phase) {
+            switch (phase) {
+                case ContextPhase::Unavailable: break;
+                case ContextPhase::Preparing: return "Preparing";
+                case ContextPhase::Ready: return "Ready";
+                case ContextPhase::Invalidated: return "Invalidated";
+            }
+            return "Unavailable";
+        };
+        Json events = Json::array();
+        for (const auto& event : contextEvents) {
+            const auto& s = event.state;
+            events.push_back({{"seq", event.seq}, {"phase", contextPhase(s.phase)}, {"reason", s.reason},
+                {"height", s.height}, {"shieldedCount", s.shieldedCount}, {"boundaryDone", s.boundaryDone},
+                {"downloadsDone", s.downloadsDone}, {"downloadsTotal", s.downloadsTotal},
+                {"proofsDone", s.proofsDone}, {"proofsTotal", s.proofsTotal},
+                {"awaitingSecondPeer", s.awaitingSecondPeer}});
         }
-        result["offlineSigning"] = {{"phase", contextPhase}, {"contextId", context.contextId},
-            {"height", context.height}, {"shieldedCount", context.shieldedCount}};
+        result["offlineSigning"] = {{"phase", contextPhase(context.phase)}, {"contextId", context.contextId},
+            {"height", context.height}, {"shieldedCount", context.shieldedCount}, {"events", std::move(events)}};
         if (snapshot_.hasRestoreProgress) {
             result["restoreCurrent"] = snapshot_.restoreCurrent;
             result["restoreTarget"] = snapshot_.restoreTarget;
@@ -2523,6 +2541,7 @@ private:
     std::atomic<bool> offlineClosing_{false};
     mutable std::mutex offlineStateMutex_;
     beam::sdk::OfflineContext::State offlineState_;
+    beam::sdk::OfflineContextEvents offlineEvents_;
     std::shared_ptr<beam::sdk::OfflineContext> offlineContext_;
     bool recoveryQuorumFailed_ = false;
     bool initialStatusLoaded_ = false;

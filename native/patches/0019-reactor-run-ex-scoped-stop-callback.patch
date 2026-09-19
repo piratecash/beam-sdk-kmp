@@ -1,0 +1,13 @@
+diff --git a/utility/io/reactor.cpp b/utility/io/reactor.cpp
+index 176faf930..92edc03b1 100644
+--- a/utility/io/reactor.cpp
++++ b/utility/io/reactor.cpp
+@@ -437,6 +437,8 @@ Reactor::~Reactor() {
+ 
+ void Reactor::run_ex(StopCallback&& scb) {
+     _stopCB = std::move(scb);
++    // The callback may capture the caller's frame: it must not outlive this run on a reused reactor.
++    struct Reset { StopCallback& cb; ~Reset() { cb = nullptr; } } reset{_stopCB};
+     run();
+ }
+ 
