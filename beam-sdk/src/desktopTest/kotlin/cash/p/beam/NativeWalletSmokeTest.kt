@@ -25,6 +25,9 @@ class NativeWalletSmokeTest {
                     assertEquals(BeamAddressType.PublicOffline, address.type)
                     assertEquals(BeamNetwork.Testnet, address.network)
                     check(address.token.isNotBlank())
+                    val regular = it.receiveAddress(BeamAddressType.Regular)
+                    assertEquals(BeamAddressType.Regular, regular.type)
+                    assertEquals(BeamAddressType.Regular, BeamTokenParser.parse(regular.token).type)
                     assertFailsWith<BeamFailure.Validation> {
                         BeamWalletFactory().openExisting(config, key)
                     }

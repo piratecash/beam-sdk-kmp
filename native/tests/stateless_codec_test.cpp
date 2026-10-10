@@ -120,6 +120,34 @@ void hostile(const ByteBuffer& bytes, const Rules& rules) {
     }
 }
 
+void regularCases(const std::filesystem::path& dir) {
+    auto db = createDb(dir / "regular-receiver.db", 80999);
+    const auto newStyle = beam::sdk::parseToken(GenerateTokenDefaultAddr(TokenType::RegularNewStyle, db));
+    require(newStyle.type == TxAddressType::Regular && newStyle.voucherCount == 0, "new-style Regular token rejected");
+    WalletAddress address;
+    db->getDefaultAddressAlways(address);
+    // Core's hex encoder strips leading zeros: 34 bytes, 33 bytes, and 33 bytes whose first byte has TokenFlag.
+    for (const auto [channel, size] : {std::pair{700u, 34u}, std::pair{5u, 33u}, std::pair{200u, 33u}}) {
+        auto id = address.m_BbsAddr;
+        id.m_Channel = channel;
+        const auto token = std::to_string(id);
+        require(from_hex(token).size() == size, "unexpected old-style WalletID shape");
+        const auto parsed = beam::sdk::parseToken(token);
+        require(parsed.type == TxAddressType::Regular && parsed.voucherCount == 0, "old-style WalletID rejected");
+    }
+    rejectsAt([] { beam::sdk::parseToken("05" + std::string(64, '0')); }, "Invalid Beam address");
+    TxParameters swap;
+    swap.SetParameter(TxParameterID::TransactionType, TxType::AtomicSwap);
+    swap.SetParameter(TxParameterID::PeerAddr, address.m_BbsAddr);
+    rejectsAt([&] { beam::sdk::parseToken(std::to_string(swap)); }, "Unsupported Beam address");
+    TxParameters unknown;
+    unknown.SetParameter(TxParameterID::TransactionType, TxType::PushTransaction);
+    unknown.SetParameter(TxParameterID::PeerEndpoint, address.m_Endpoint);
+    rejectsAt([&] { beam::sdk::parseToken(std::to_string(unknown)); }, "Unsupported Beam address");
+    std::cout << "STATELESS_REGULAR_OK new_style old_style_34 old_style_33 old_style_33_token_flag"
+        " invalid_wallet_id atomic_swap unknown\n";
+}
+
 void codecFixture(const std::filesystem::path& dir) {
     auto reactor = io::Reactor::create();
     io::Reactor::Scope reactorScope(*reactor);
@@ -176,7 +204,18 @@ void codecFixture(const std::filesystem::path& dir) {
             }
             parameters = *ParseParameters(recipient.token);
             parameters.SetParameter(TxParameterID::TransactionType, TxType::Simple);
-            rejectsAt([&] { beam::sdk::parseToken(std::to_string(parameters)); }, "Interactive");
+            // Core classifies any Simple token as Regular; only Offline tokens carry a peer address.
+            if (type == TxAddressType::Offline)
+                require(beam::sdk::parseToken(std::to_string(parameters)).type == TxAddressType::Regular,
+                    "Simple token with a valid peer address is not Regular");
+            else
+                rejectsAt([&] { beam::sdk::parseToken(std::to_string(parameters)); }, "peer address");
+            WalletID invalidPeer;
+            invalidPeer.m_Channel = 5u;
+            invalidPeer.m_Pk = Zero;
+            parameters.SetParameter(TxParameterID::PeerAddr, invalidPeer);
+            // Core's own token validation already refuses an invalid WalletID field.
+            rejectsAt([&] { beam::sdk::parseToken(std::to_string(parameters)); }, "Invalid Beam token");
             tokenBytes.push_back(0);
             rejects([&] { beam::sdk::parseToken(EncodeToBase58(tokenBytes)); }, "trailing token bytes accepted");
             Captured captured;
@@ -220,6 +259,7 @@ void codecFixture(const std::filesystem::path& dir) {
             "contextual node accepted corrupt shielded spend proof");
         std::cout << "STATELESS_CONTEXT_FREE_OK_NODE_REJECTS_BAD_SHIELDED_SPEND_PROOF\n";
     }
+    regularCases(dir);
     rejects([] { beam::sdk::parseToken(std::string(beam::sdk::kMaxTokenChars + 1, '1')); }, "oversized token accepted");
     rejects([] { beam::sdk::parseToken("not a token"); }, "malformed token accepted");
     rejects([] { beam::sdk::parseToken(std::string(70, '0') + 'Z'); }, "malformed hex/Base58 accepted");
@@ -231,7 +271,9 @@ void codecFixture(const std::filesystem::path& dir) {
     rejectsAt([&] { beam::sdk::parseToken(std::to_string(oversizedField)); }, "vector count");
     TxParameters interactive;
     interactive.SetParameter(TxParameterID::TransactionType, TxType::Simple);
-    rejects([&] { beam::sdk::parseToken(std::to_string(interactive)); }, "interactive token accepted");
+    // Longer than a WalletID: shorter bytes are read as an old-style id, exactly as Core does.
+    interactive.SetParameter(TxParameterID::PeerEndpoint, PeerID(Zero));
+    rejectsAt([&] { beam::sdk::parseToken(std::to_string(interactive)); }, "peer address");
     std::cout << "STATELESS_TOKEN_REJECTIONS_OK invalid_signature trailing malformed_hex_base58 length interactive voucher_count_before_alloc\n"
         << "STATELESS_RAW_REJECTIONS_OK vector256 aggregate1024 depth proof_configs rules_network trailing noncanonical unknown_kernel\n";
 }

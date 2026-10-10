@@ -321,6 +321,10 @@ private class JniBeamBackend : BeamBackend {
         ioCall { BeamNative.abortPrepared(requireHandle(), operationId) }
     }
 
+    override suspend fun cancelTransaction(transactionId: String): Boolean = gate.withLock {
+        ioCall { BeamNative.cancelTransaction(requireHandle(), transactionId) }
+    }
+
     override suspend fun sendOperations(): List<BeamSendOperation> = gate.withLock {
         ioCall { BeamNative.sendOperations(requireHandle()).toSendOperations() }
     }
@@ -490,6 +494,7 @@ internal fun Throwable.asBeamFailure(): BeamFailure {
     nativeFailure("SIGNING_INTERRUPTED")?.let { return BeamFailure.SigningInterrupted(it) }
     nativeFailure("OPERATION_CONFLICT")?.let { return BeamFailure.OperationConflict(it) }
     nativeFailure("UNSUPPORTED")?.let { return BeamFailure.Unsupported(it) }
+    nativeFailure("ONLINE_ONLY")?.let { return BeamFailure.OnlineOnly(it) }
     nativeFailure("VALIDATION")?.let { return BeamFailure.Validation(it) }
     nativeFailure("INSUFFICIENT_FUNDS")?.let { return BeamFailure.InsufficientFunds(it) }
     nativeFailure("STORAGE")?.let { return BeamFailure.Storage(it, this) }
@@ -569,6 +574,7 @@ internal object BeamNative {
     external fun sendOperations(handle: Long): String
     external fun recoverSendOperations(handle: Long): String
     external fun abortPrepared(handle: Long, operationId: String): Boolean
+    external fun cancelTransaction(handle: Long, transactionId: String): Boolean
     external fun seedPreparedSendForTests(handle: Long, operationId: String): String
     external fun seedInterruptedBootstrapForTests(handle: Long)
     external fun bodyRequestsPendingForTests(handle: Long): Boolean

@@ -76,7 +76,8 @@ constexpr const char* kNewWalletCreatedAtVar = "beam.sdk.kmp.new-wallet.created-
 constexpr const char* kSnapshotPathVar = "beam.sdk.kmp.restore.snapshot.path.v1";
 constexpr const char* kSnapshotUrlVar = "beam.sdk.kmp.restore.snapshot.url.v1";
 constexpr const char* kSnapshotHashVar = "beam.sdk.kmp.restore.snapshot.sha256.v1";
-constexpr const char* kActiveSendVar = "beam.sdk.kmp.send.active.v1";
+// Single-send admission key written by older SDK versions; removed on the next inventory read.
+constexpr const char* kLegacyActiveSendVar = "beam.sdk.kmp.send.active.v1";
 constexpr std::uint64_t kMaxJavaLong = std::numeric_limits<std::int64_t>::max();
 constexpr Height kBirthdaySafetyWindow = 1'440;
 constexpr Timestamp kNewWalletTipFreshnessTolerance = 10 * 60;
@@ -122,7 +123,7 @@ enum class SendState {
 
 class SendAdmissionDeferred final : public std::runtime_error {
 public:
-    SendAdmissionDeferred() : std::runtime_error("Another Beam outgoing transaction is unresolved; retry the same operation after reconciliation") {}
+    SendAdmissionDeferred() : std::runtime_error("Beam recognition recovery is in progress; retry the same operation after it completes") {}
 };
 
 struct SendRecord {
@@ -544,21 +545,29 @@ std::string txIdString(const TxID& txId) {
     return beam::to_hex(txId.data(), txId.size());
 }
 
-TxAddressType requireOneSidedAddress(const std::string& receiver) {
-    if (!beam::wallet::CheckReceiverAddress(receiver)) {
-        throw std::invalid_argument("Receiver token is invalid");
+// The quote validator, so nothing a quote accepted can fail in LoadReceiverParams after Committing.
+TxAddressType requireSupportedAddress(const std::string& receiver) {
+    try {
+        return beam::sdk::parseToken(receiver).type;
+    } catch (const std::exception&) {
+        throw std::invalid_argument("Receiver token is invalid or unsupported");
     }
-    auto type = beam::wallet::GetAddressType(receiver);
-    if (type != TxAddressType::Offline &&
-        type != TxAddressType::PublicOffline &&
-        type != TxAddressType::MaxPrivacy) {
-        throw std::invalid_argument("Only one-sided Beam receiver tokens are supported");
+}
+
+// Stored receivers passed Core's lenient check when written; the strict parser must not strand them.
+TxAddressType requireStoredReceiverAddress(const std::string& receiver) {
+    if (!beam::wallet::CheckReceiverAddress(receiver)) throw std::invalid_argument("Receiver token is invalid");
+    const auto type = beam::wallet::GetAddressType(receiver);
+    if (type != TxAddressType::Regular && type != TxAddressType::Offline &&
+        type != TxAddressType::PublicOffline && type != TxAddressType::MaxPrivacy) {
+        throw std::invalid_argument("Unsupported stored Beam receiver type");
     }
     return type;
 }
 
 std::string addressTypeName(TxAddressType type) {
     switch (type) {
+        case TxAddressType::Regular: return "Regular";
         case TxAddressType::Offline: return "Offline";
         case TxAddressType::PublicOffline: return "PublicOffline";
         case TxAddressType::MaxPrivacy: return "MaxPrivacy";
@@ -571,6 +580,7 @@ TokenType tokenType(int ordinal) {
         case 0: return TokenType::Offline;
         case 1: return TokenType::Public;
         case 2: return TokenType::MaxPrivacy;
+        case 3: return TokenType::RegularNewStyle;
         default: throw std::invalid_argument("Unknown Beam address type");
     }
 }
@@ -580,6 +590,7 @@ std::string tokenTypeName(int ordinal) {
         case 0: return "Offline";
         case 1: return "PublicOffline";
         case 2: return "MaxPrivacy";
+        case 3: return "Regular";
         default: throw std::invalid_argument("Unknown Beam address type");
     }
 }
@@ -592,7 +603,7 @@ void copyParameter(TxParameterID id, const TxParameters& source, TxParameters& t
 TxParameters makeSendParameters(const SendRecord& record) {
     auto receiverParameters = beam::wallet::ParseParameters(record.receiver);
     if (!receiverParameters) throw std::invalid_argument("Receiver token is invalid");
-    auto type = requireOneSidedAddress(record.receiver);
+    auto type = requireStoredReceiverAddress(record.receiver);
     auto txId = parseTxId(record.txId);
     auto parameters = record.isOffline() ? beam::wallet::lelantus::CreatePushTransactionParameters(txId) :
         beam::wallet::CreateSimpleTransactionParameters(txId);
@@ -628,6 +639,15 @@ std::string transactionStatus(TxStatus status) {
     return "Unknown";
 }
 
+std::string failureReasonName(TxFailureReason reason) {
+    switch (reason) {
+#define MACRO(name, code, message) case TxFailureReason::name: return #name;
+        BEAM_TX_FAILURE_REASON_MAP(MACRO)
+#undef MACRO
+    }
+    return std::to_string(static_cast<std::int32_t>(reason));
+}
+
 bool isTerminal(TxStatus status) {
     return status == TxStatus::Completed || status == TxStatus::Failed || status == TxStatus::Canceled;
 }
@@ -653,7 +673,7 @@ Json transactionJson(const TransactionSnapshot& snapshot) {
         {"counterparty", counterparty.empty() ? Json(nullptr) : Json(counterparty)},
         {"status", transactionStatus(transaction.m_status)},
         {"failureReason", transaction.m_status == TxStatus::Failed
-            ? Json(std::to_string(static_cast<std::uint32_t>(transaction.m_failureReason)))
+            ? Json(failureReasonName(transaction.m_failureReason))
             : Json(nullptr)},
     };
 }
@@ -1239,11 +1259,11 @@ public:
     std::string previewSend(const std::string& receiver, std::uint64_t amount, const std::string& comment) {
         return invoke<std::string>([this, receiver, amount, comment]() {
             requireRecoveryAdmissionOnWalletThread();
-            auto type = requireOneSidedAddress(receiver);
+            auto type = requireSupportedAddress(receiver);
             CoinsSelectionInfo selection;
             selection.m_requestedSum = amount;
             selection.m_assetID = Asset::s_BeamID;
-            selection.Calculate(database_->getCurrentHeight(), database_, true);
+            selection.Calculate(database_->getCurrentHeight(), database_, beam::sdk::isPushTx(type));
             if (!selection.m_isEnought) throw std::runtime_error("Insufficient Beam funds including fee");
             auto fee = selection.get_TotalFee();
             if (amount > kMaxJavaLong - fee) throw std::overflow_error("Send total overflows SDK amount model");
@@ -1334,7 +1354,7 @@ public:
         if (!offlineContext_) throw beam::sdk::SendError("CONTEXT_UNAVAILABLE", "Missing offline context");
         const auto context = beam::sdk::SigningContext::capture(db, *offlineContext_, contextId);
         if (!existing) {
-            requireSendAdmissionOnWalletThread(operationId);
+            requireSendAdmissionOnWalletThread();
             const auto q = beam::sdk::quoteSend(db, receiver, amount, maximum, comment, contextId);
             if (q.version != version) throw beam::sdk::SendError("STALE_QUOTE", "Send quote is stale");
             record.offline = true; record.maximum = maximum;
@@ -1347,8 +1367,7 @@ public:
             durableSendWrite([&] { saveSendRecord(*db, record); sendBoundary("offline-intent-record"); });
             sendBoundary("offline-intent"); // must precede Creator and any resumable Core row
         } else {
-            const auto own = parseTxId(record.txId);
-            requireSendAdmissionOnWalletThread(operationId, &own);
+            requireSendAdmissionOnWalletThread();
             if (record.rules != context.rules) throw beam::sdk::SendError("CONTEXT_UNAVAILABLE", "Signing rules changed");
         }
         auto parameters = makeSendParameters(record);
@@ -1496,7 +1515,7 @@ private:
         }
     }
 
-    std::vector<SendRecord> sendRecordsOnWalletThread() const {
+    std::vector<SendRecord> sendRecordsOnWalletThread() {
         auto database = std::dynamic_pointer_cast<beam::wallet::WalletDB>(database_);
         if (!database) throw std::runtime_error("Beam WalletDB does not support send inventory");
         const auto variables = database->getBlobsByPrefix("beam.sdk.kmp.send.v");
@@ -1510,10 +1529,9 @@ private:
             }
             records.push_back(std::move(record));
         }
-        std::string active;
-        if (getRawString(*database_, kActiveSendVar, active) && !active.empty() &&
-            std::none_of(records.begin(), records.end(), [&](const auto& record) { return record.operationId == active; })) {
-            throw SendAdmissionDeferred();
+        std::string legacy;
+        if (getRawString(*database_, kLegacyActiveSendVar, legacy)) {
+            durableSendWrite([&] { database_->removeVarRaw(kLegacyActiveSendVar); });
         }
         return records;
     }
@@ -1568,13 +1586,8 @@ private:
 
     std::string recoverSendOperationsOnWalletThread(const Wallet::Ptr& wallet) {
         requireRecoveryAdmissionOnWalletThread();
-        const auto records = sendRecordsOnWalletThread();
         // Validate all records and admission before any reconciliation or transaction creation.
-        for (const auto& record : records) {
-            if (record.isOffline()) continue;
-            const auto txId = parseTxId(record.txId);
-            if (!database_->getTx(txId)) requireSendAdmissionOnWalletThread(record.operationId, &txId);
-        }
+        const auto records = sendRecordsOnWalletThread();
         for (auto record : records) {
             if (record.isOffline()) continue;
             if (record.state != SendState::Submitted && !database_->getTx(parseTxId(record.txId))) {
@@ -1602,7 +1615,7 @@ private:
             }
             return Json({{"transactionId", existing.txId}}).dump();
         }
-        requireSendAdmissionOnWalletThread(operationId);
+        requireSendAdmissionOnWalletThread();
         auto preview = previewMaterial(receiver, amount, comment);
         if (preview.first != previewVersion) throw beam::sdk::SendError("STALE_QUOTE", "Send preview is stale");
         SendRecord record;
@@ -1614,7 +1627,8 @@ private:
         record.fee = previewFee(receiver, amount);
         CoinsSelectionInfo selection;
         selection.m_requestedSum = amount;
-        selection.Calculate(database_->getCurrentHeight(), database_, true);
+        selection.Calculate(database_->getCurrentHeight(), database_,
+            beam::sdk::isPushTx(requireSupportedAddress(receiver)));
         record.explicitFee = selection.m_explicitFee;
         record.previewVersion = previewVersion;
         record.requestHash = preview.second;
@@ -1622,8 +1636,6 @@ private:
         durableSendWrite([&] {
             saveSendRecord(*database_, record);
             sendBoundary("prepare-record");
-            setRawString(*database_, kActiveSendVar, operationId);
-            sendBoundary("prepare-marker");
         });
         sendBoundary("prepared");
         return Json({{"transactionId", record.txId}}).dump();
@@ -1635,15 +1647,12 @@ private:
         if (!loadSendRecord(*database_, operationId, record)) return sendResolution("NotPrepared").dump();
         if (record.isOffline()) return observeSendOnWalletThread(record).dump();
         if (record.state == SendState::Prepared || record.state == SendState::Committing) {
+            // Deferred retries leave the durable journal byte-for-byte unchanged,
+            // including Prepared before its Committing durability fence.
             requireRecoveryAdmissionOnWalletThread();
         }
         const auto txId = parseTxId(record.txId);
         const bool hasCoreRow = static_cast<bool>(database_->getTx(txId));
-        if (!hasCoreRow && (record.state == SendState::Prepared || record.state == SendState::Committing)) {
-            // Deferred retries leave the durable journal byte-for-byte unchanged,
-            // including Prepared before its Committing durability fence.
-            requireSendAdmissionOnWalletThread(operationId, &txId);
-        }
         if (record.state == SendState::Prepared) {
             record.state = SendState::Committing;
             durableSendWrite([&] {
@@ -1690,28 +1699,10 @@ private:
         if (!database || !database->IsSelectionAllowed()) throw SendAdmissionDeferred();
     }
 
-    void requireSendAdmissionOnWalletThread(const std::string& operationId, const TxID* ownTxId = nullptr) {
+    // Concurrent sends are admitted; each record's own txId and Core row keep it exactly-once.
+    void requireSendAdmissionOnWalletThread() {
         requireRecoveryAdmissionOnWalletThread();
-        const auto records = sendRecordsOnWalletThread();
-        // The marker is only a journal hint: resolveSend clears it at Terminal,
-        // but a later Core rollback can reactivate that very same outgoing TxID.
-        for (const auto& transaction : database_->getTxHistory(TxType::ALL)) {
-            const auto offline = std::find_if(records.begin(), records.end(), [&](const auto& r) {
-                return r.isOffline() && parseTxId(r.txId) == transaction.m_txId;
-            });
-            // Signed and Exported offline rows hold no coins and never defer a send.
-            if (offline != records.end() && offline->state != SendState::Signing) continue;
-            if (transaction.m_sender && (!ownTxId || transaction.m_txId != *ownTxId) &&
-                !isTerminal(transaction.m_status)) {
-                throw SendAdmissionDeferred();
-            }
-        }
-        for (const auto& record : records) {
-            if (ownTxId && record.operationId == operationId && parseTxId(record.txId) == *ownTxId) continue;
-            if (record.isOffline() && record.state != SendState::Signing) continue;
-            const auto transaction = database_->getTx(parseTxId(record.txId));
-            if (!transaction || !isTerminal(transaction->m_status)) throw SendAdmissionDeferred();
-        }
+        sendRecordsOnWalletThread();
     }
 
 public:
@@ -1760,9 +1751,19 @@ public:
             durableSendWrite([&] {
                 database_->removeVarRaw(key.c_str());
                 sendBoundary("abort-record");
-                clearActiveSendIfMatches(operationId);
-                sendBoundary("abort-marker");
             });
+            return true;
+        });
+    }
+
+    bool cancelTransaction(const std::string& transactionId) {
+        return invokeWithClient<bool>([this, transactionId](const auto& client) {
+            const auto wallet = client->getWallet();
+            const auto id = parseTxId(transactionId);
+            if (!wallet || wallet->IsOfflineTransaction(id) || !wallet->CanCancelTransaction(id)) return false;
+            wallet->CancelTransaction(id);
+            // Core commits only on its flush timer; the ack must not outlive a crash.
+            flushDatabase(database_);
             return true;
         });
     }
@@ -1785,7 +1786,6 @@ public:
         record.previewVersion = digest.first;
         record.state = SendState::Prepared;
         saveSendRecord(*database_, record);
-        setRawString(*database_, kActiveSendVar, operationId);
         flushDatabase(database_);
         return record.txId;
     }
@@ -2267,11 +2267,11 @@ private:
     }
 
     std::uint64_t previewFee(const std::string& receiver, std::uint64_t amount) {
-        requireOneSidedAddress(receiver);
+        auto type = requireSupportedAddress(receiver);
         CoinsSelectionInfo selection;
         selection.m_requestedSum = amount;
         selection.m_assetID = Asset::s_BeamID;
-        selection.Calculate(database_->getCurrentHeight(), database_, true);
+        selection.Calculate(database_->getCurrentHeight(), database_, beam::sdk::isPushTx(type));
         if (!selection.m_isEnought) throw std::runtime_error("Insufficient Beam funds including fee");
         return selection.get_TotalFee();
     }
@@ -2298,17 +2298,9 @@ private:
                     record.state = SendState::Submitted;
                     saveSendRecord(*database_, record);
                 }
-                if (isTerminal(transaction->m_status)) clearActiveSendIfMatches(record.operationId);
             });
         }
         return observeSendOnWalletThread(record);
-    }
-
-    void clearActiveSendIfMatches(const std::string& operationId) {
-        std::string activeOperation;
-        if (getRawString(*database_, kActiveSendVar, activeOperation) && activeOperation == operationId) {
-            database_->removeVarRaw(kActiveSendVar);
-        }
     }
 
     void maybeStartBootstrapLocked() {
@@ -3057,6 +3049,18 @@ Java_cash_p_beam_internal_BeamNative_abortPrepared(
 ) {
     return jniCall(environment, [&]() -> jboolean {
         return requireSession(handle)->abortPrepared(javaString(environment, operationId)) ? JNI_TRUE : JNI_FALSE;
+    }, JNI_FALSE);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_cash_p_beam_internal_BeamNative_cancelTransaction(
+    JNIEnv* environment,
+    jobject,
+    jlong handle,
+    jstring transactionId
+) {
+    return jniCall(environment, [&]() -> jboolean {
+        return requireSession(handle)->cancelTransaction(javaString(environment, transactionId)) ? JNI_TRUE : JNI_FALSE;
     }, JNI_FALSE);
 }
 

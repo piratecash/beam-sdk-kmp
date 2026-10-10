@@ -12,6 +12,7 @@ public interface BeamWalletSession {
     public suspend fun start()
     public suspend fun stop()
     public suspend fun close()
+    /** A [BeamAddressType.Regular] address receives only while the wallet is started. */
     public suspend fun receiveAddress(type: BeamAddressType = BeamAddressType.PublicOffline): BeamAddress
     /** Same view as [transactions]. */
     public suspend fun transactionPage(offset: Int, limit: Int): BeamTransactionPage
@@ -52,7 +53,7 @@ public interface BeamWalletSession {
      */
     public suspend fun sendOperations(): List<BeamSendOperation>
     /** Explicit Ready-only recovery. May submit previously prepared sends using their stored TxIDs.
-     * Conflicting unresolved operations defer recovery; opening or listing never triggers it.
+     * Recognition recovery in progress defers the call; opening or listing never triggers it.
      * Ownership is local to this database, not shared across restored copies or devices.
      */
     public suspend fun recoverSendOperations(): List<BeamSendOperation>
@@ -61,4 +62,10 @@ public interface BeamWalletSession {
      * Returns false for Exported, including a lost export response; it can never revoke bytes.
      */
     public suspend fun abortPrepared(operationId: String): Boolean
+    /** Cancels an own Pending/InProgress Core transaction, notifying the peer if negotiation started.
+     * Requires an open Ready session that is not starting or stopping, else [IllegalStateException];
+     * [transactionId] must be 32 lowercase hex chars as in [BeamTransaction.id], else [IllegalArgumentException].
+     * Returns true only once the cancellation is durable; false when Core no longer allows it, including offline sends.
+     */
+    public suspend fun cancelTransaction(transactionId: String): Boolean
 }

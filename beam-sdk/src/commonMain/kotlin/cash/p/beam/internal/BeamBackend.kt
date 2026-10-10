@@ -46,6 +46,7 @@ internal interface BeamBackend {
     suspend fun sendOperations(): List<BeamSendOperation>
     suspend fun recoverSendOperations(): List<BeamSendOperation>
     suspend fun abortPrepared(operationId: String): Boolean
+    suspend fun cancelTransaction(transactionId: String): Boolean
 }
 
 internal data class BackendSnapshot(

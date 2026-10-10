@@ -80,6 +80,7 @@ Java_cash_p_beam_internal_BeamCodecNative_parseToken(JNIEnv* env, jobject, jstri
         const auto parsed = beam::sdk::parseToken(ascii(env, token, beam::sdk::kMaxTokenChars));
         const char* type = nullptr;
         switch (parsed.type) {
+            case beam::wallet::TxAddressType::Regular: type = "Regular"; break;
             case beam::wallet::TxAddressType::Offline: type = "Offline"; break;
             case beam::wallet::TxAddressType::PublicOffline: type = "PublicOffline"; break;
             case beam::wallet::TxAddressType::MaxPrivacy: type = "MaxPrivacy"; break;

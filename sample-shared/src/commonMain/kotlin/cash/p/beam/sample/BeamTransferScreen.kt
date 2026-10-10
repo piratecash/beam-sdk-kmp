@@ -97,6 +97,7 @@ private fun BeamAddressType.label(): String = when (this) {
     BeamAddressType.PublicOffline -> "Public offline"
     BeamAddressType.Offline -> "Offline"
     BeamAddressType.MaxPrivacy -> "Max privacy"
+    BeamAddressType.Regular -> "Regular"
 }
 
 private fun BeamAddressType.description(): String = when (this) {
@@ -106,4 +107,6 @@ private fun BeamAddressType.description(): String = when (this) {
         "One-sided token containing vouchers for up to 10 payments while the receiver is offline."
     BeamAddressType.MaxPrivacy ->
         "Single-payment token using the maximum anonymity set; settlement can take up to 72 hours."
+    BeamAddressType.Regular ->
+        "Interactive address: keep this wallet running until the sender's payment completes."
 }

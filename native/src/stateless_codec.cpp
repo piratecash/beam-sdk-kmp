@@ -169,22 +169,29 @@ ParsedToken parseToken(const std::string& token) {
     bool hex = true;
     auto bytes = from_hex(token, &hex);
     if (!hex) bytes = wallet::DecodeBase58(token);
-    check(bytes.size() > 33 && (bytes.front() & wallet::TxToken::TokenFlag),
-        "Only one-sided Beam tokens are supported");
     // Used only to preflight unrelated optional parameter types. Tokens do not
     // encode this network and this function neither detects nor returns a network.
     Rules rules;
     Rules::Scope scope(rules);
-    wallet::TxToken decoded;
-    decodeExact(bytes, decoded, rules, true);
+    // Same token/WalletID discriminator as Core's ParseParameters.
+    if (bytes.size() > 33 && (bytes.front() & wallet::TxToken::TokenFlag)) {
+        wallet::TxToken decoded;
+        decodeExact(bytes, decoded, rules, true);
+    } else {
+        wallet::WalletID id;
+        check(id.FromBuf(bytes) && id.IsValid(), "Invalid Beam address");
+    }
     auto params = wallet::ParseParameters(token);
     check(!!params, "Invalid Beam token");
     const auto type = wallet::GetAddressType(token);
     using wallet::TxAddressType;
-    check(type == TxAddressType::Offline || type == TxAddressType::PublicOffline ||
-        type == TxAddressType::MaxPrivacy, "Interactive or unsupported Beam address");
+    check(type == TxAddressType::Regular || type == TxAddressType::Offline ||
+        type == TxAddressType::PublicOffline || type == TxAddressType::MaxPrivacy, "Unsupported Beam address");
     size_t count = 0;
-    if (type == TxAddressType::Offline || type == TxAddressType::MaxPrivacy) {
+    if (type == TxAddressType::Regular) {
+        // Core classifies Regular by TransactionType alone, but sending needs a valid peer.
+        check(!!params->GetParameter<wallet::WalletID>(wallet::TxParameterID::PeerAddr), "Missing peer address");
+    } else if (type == TxAddressType::Offline || type == TxAddressType::MaxPrivacy) {
         auto endpoint = params->GetParameter<PeerID>(wallet::TxParameterID::PeerEndpoint);
         check(!!endpoint, "Missing token endpoint");
         if (type == TxAddressType::Offline) {

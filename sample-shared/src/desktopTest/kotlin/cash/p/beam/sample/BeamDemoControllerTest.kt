@@ -933,4 +933,5 @@ private class FakeDemoSession(
     override suspend fun sendOperations(): List<cash.p.beam.BeamSendOperation> = emptyList()
     override suspend fun recoverSendOperations(): List<cash.p.beam.BeamSendOperation> = emptyList()
     override suspend fun abortPrepared(operationId: String): Boolean = false
+    override suspend fun cancelTransaction(transactionId: String): Boolean = false
 }

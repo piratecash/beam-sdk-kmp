@@ -11,6 +11,9 @@ public:
     SendError(const char* code, const char* message) : std::runtime_error(message), code(code) {}
 };
 
+// Regular is an interactive Simple transaction priced with ordinary outputs; others push a shielded output.
+inline bool isPushTx(wallet::TxAddressType type) { return type != wallet::TxAddressType::Regular; }
+
 // Owner-thread only. No receiver-specific material is required during prior normal sync.
 struct SendQuote {
     wallet::CoinsSelectionInfo selection;

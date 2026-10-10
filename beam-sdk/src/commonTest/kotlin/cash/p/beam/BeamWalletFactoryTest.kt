@@ -350,6 +350,22 @@ class BeamWalletFactoryTest {
     }
 
     @Test
+    fun cancelTransaction_requiresReadyAndWellFormedId() = runTest {
+        val backend = FakeBackend()
+        val session = factory(backend).createNew(config(), ByteArray(64), ByteArray(32))
+
+        assertFailsWith<IllegalStateException> { session.cancelTransaction(TRANSACTION_ID) }
+        session.start()
+        session.state.first { it is BeamWalletState.Ready }
+        assertFailsWith<IllegalArgumentException> { session.cancelTransaction("tx-1") }
+        assertFailsWith<IllegalArgumentException> { session.cancelTransaction(TRANSACTION_ID.uppercase()) }
+        assertEquals(emptyList(), backend.cancelledTransactionIds)
+
+        assertTrue(session.cancelTransaction(TRANSACTION_ID))
+        assertEquals(listOf(TRANSACTION_ID), backend.cancelledTransactionIds)
+    }
+
+    @Test
     fun syncingState_carriesScanCounters() = runTest {
         // The height pair follows the chain tip, so it can sit still or grow while blocks are
         // being scanned. syncDone/syncTotal are the only numbers that actually advance, and the
@@ -513,6 +529,7 @@ class BeamWalletFactoryTest {
 
     private companion object {
         const val OPERATION_ID = "123e4567-e89b-42d3-a456-426614174000"
+        const val TRANSACTION_ID = "0123456789abcdef0123456789abcdef"
     }
 }
 
@@ -691,6 +708,12 @@ private class FakeBackend(
 
     override suspend fun abortPrepared(operationId: String): Boolean {
         abortCalls++
+        return true
+    }
+
+    val cancelledTransactionIds = mutableListOf<String>()
+    override suspend fun cancelTransaction(transactionId: String): Boolean {
+        cancelledTransactionIds += transactionId
         return true
     }
 }

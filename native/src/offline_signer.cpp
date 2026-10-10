@@ -21,10 +21,10 @@ std::string hash(const ByteBuffer& b) {
     ECC::Hash::Processor() << Blob(b.data(), static_cast<uint32_t>(b.size())) >> h;
     return to_hex(h.m_pData, h.nBytes);
 }
-CoinsSelectionInfo exact(const std::shared_ptr<WalletDB>& db, Height h, Amount amount) {
+CoinsSelectionInfo exact(const std::shared_ptr<WalletDB>& db, Height h, Amount amount, bool pushTx) {
     CoinsSelectionInfo q;
     q.m_requestedSum = amount;
-    q.Calculate(h, db, true);
+    q.Calculate(h, db, pushTx);
     Amount total = amount; checkedAdd(total, q.get_TotalFee());
     return q;
 }
@@ -56,7 +56,10 @@ SendQuote quoteSend(const std::shared_ptr<wallet::WalletDB>& db, const std::stri
     using namespace wallet;
     SendQuote result;
     try { result.receiverType = parseToken(receiver).type; }
-    catch (...) { throw SendError("INVALID_ADDRESS", "Invalid or unsupported one-sided receiver"); }
+    catch (...) { throw SendError("INVALID_ADDRESS", "Invalid or unsupported receiver"); }
+    if (!contextId.empty() && result.receiverType == TxAddressType::Regular)
+        throw SendError("ONLINE_ONLY", "Interactive receiver requires an online send");
+    const bool pushTx = isPushTx(result.receiverType);
     if (!db->IsSelectionAllowed()) throw SendError("SEND_BUSY", "Wallet selection is not admitted");
     result.height = db->getCurrentHeight();
     result.rules = Rules::get().get_SignatureStr();
@@ -76,14 +79,14 @@ SendQuote quoteSend(const std::shared_ptr<wallet::WalletDB>& db, const std::stri
         // Calculate deliberately on the upper bound even when insufficient: Core caps the
         // shielded count and reports the actually selectable sum and actual input fees.
         if (!upper) throw SendError("INSUFFICIENT_FUNDS", "Insufficient Beam funds");
-        const auto bound = exact(db, result.height, upper);
+        const auto bound = exact(db, result.height, upper, pushTx);
         amount = bound.get_NettoValue();
         if (!amount) throw SendError("INSUFFICIENT_FUNDS", "Insufficient Beam funds after Core fees");
     }
     std::set<Amount> tried;
     for (unsigned attempt = 0; attempt != 8; ++attempt) {
         if (!amount || !tried.insert(amount).second) break;
-        auto q = exact(db, result.height, amount);
+        auto q = exact(db, result.height, amount, pushTx);
         if (q.m_isEnought) {
             result.selection = q;
             // This is exactly the first builder Balance request. Involuntary shielded fees

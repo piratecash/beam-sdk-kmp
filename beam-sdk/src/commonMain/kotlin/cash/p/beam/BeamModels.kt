@@ -152,6 +152,8 @@ public enum class BeamAddressType {
     Offline,
     PublicOffline,
     MaxPrivacy,
+    /** Interactive SBBS address: online only, both wallets must be running to complete. Keep last. */
+    Regular,
 }
 
 public data class BeamAddress(
@@ -265,7 +267,7 @@ public sealed class BeamFailure(
     public class OperationConflict(message: String) : BeamFailure(message, retryable = false)
     public class Validation(message: String) : BeamFailure(message, retryable = false)
     public class InsufficientFunds(message: String) : BeamFailure(message, retryable = false)
-    /** Admission postponed by an unresolved outgoing transaction. Retry with the same operationId. */
+    /** Recognition recovery in progress defers the call. Retry with the same operationId. */
     public class SendAdmissionDeferred(message: String, cause: Throwable? = null) :
         BeamFailure(message, cause, retryable = true)
     public class Node(message: String, cause: Throwable? = null) :
@@ -281,6 +283,8 @@ public sealed class BeamFailure(
     public class Native(message: String, cause: Throwable? = null) :
         BeamFailure(message, cause, retryable = false)
     public class Unsupported(message: String) : BeamFailure(message, retryable = false)
+    /** The receiver negotiates interactively, so it cannot be paid by offline signing. */
+    public class OnlineOnly(message: String) : BeamFailure(message, retryable = false)
     public class Cancelled : BeamFailure("Operation cancelled", retryable = true)
 }
 

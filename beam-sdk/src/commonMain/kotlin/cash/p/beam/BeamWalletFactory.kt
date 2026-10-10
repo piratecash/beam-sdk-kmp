@@ -362,6 +362,12 @@ private class DefaultBeamWalletSession(
         return backend.abortPrepared(operationId)
     }
 
+    override suspend fun cancelTransaction(transactionId: String): Boolean = mutex.withLock {
+        checkReady()
+        require(transactionId.matches(TRANSACTION_ID_PATTERN)) { "transactionId must be a Beam transaction id" }
+        backend.cancelTransaction(transactionId)
+    }
+
     private fun checkOpen() {
         check(!closed) { "Beam wallet session is closed" }
     }
@@ -398,6 +404,7 @@ private class DefaultBeamWalletSession(
     private companion object {
         const val MAX_PAGE_SIZE = 200
         const val MAX_COMMENT_BYTES = 1_024
+        val TRANSACTION_ID_PATTERN = Regex("[0-9a-f]{32}")
         val UUID_PATTERN = Regex(
             "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
         )

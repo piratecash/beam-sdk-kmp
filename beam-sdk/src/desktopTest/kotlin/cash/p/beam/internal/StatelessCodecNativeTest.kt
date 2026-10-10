@@ -29,7 +29,7 @@ class StatelessCodecNativeTest {
         assertFailsWith<IllegalArgumentException> { BeamCodecNative.parseToken("1".repeat(65_537)) }
         assertFailsWith<IllegalArgumentException> { BeamCodecNative.parseToken("\u0000") }
         assertFailsWith<IllegalArgumentException> { BeamCodecNative.rules(-1) }
-        assertFailsWith<IllegalArgumentException> { BeamTokenParser.parse("notatoken") }
+        assertFailsWith<IllegalArgumentException> { BeamTokenParser.parse("0notatoken") }
         val rules = BeamTransactionInspector.supportedRules(BeamNetwork.Mainnet)
         assertFailsWith<IllegalArgumentException> { BeamCodecNative.inspect(ByteArray(1_048_577), 0, rules.signature) }
         assertFailsWith<IllegalArgumentException> { BeamTransactionInspector.inspect(byteArrayOf(1), rules) }

@@ -17,10 +17,13 @@ recovery, lifecycle, and release contract is summarized below.
   bodies are committed (`BeamSdkConfig.requireRecoveryQuorum`, off by default);
 - bounded reversible shielded-output count checkpoints for reorgs, with safe full-count fallback
   for a fork deeper than retained history;
-- one-sided receive tokens, balance/history, fee preview and durable
-  `prepare → commit → resolve` sending;
+- one-sided and Regular (interactive SBBS) receive tokens, balance/history (a failed transaction
+  carries Beam Core's failure reason name, e.g. `TransactionExpired`), fee preview and durable
+  `prepare → commit → resolve` sending; a Regular send completes only while both wallets are
+  running, and `cancelTransaction` cancels an own Pending/InProgress transaction;
 - durable post-sync offline-signing context plus stopped-wallet `quoteSend`, `signOffline` and
-  `exportSignedTransaction` flows for native BEAM one-sided sends;
+  `exportSignedTransaction` flows for native BEAM one-sided sends (a Regular receiver is refused
+  with `BeamFailure.OnlineOnly`);
 - bounded stateless token parsing and signed-transaction inspection, plus isolated foreign
   transaction relay without opening or changing a wallet;
 - serialized, idempotent `start/stop/close`, including cancellation during snapshot download/import
