@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "29d1cb8242c96b7167a84e7de730378b794f06fe",
+  "testedCommit": "4850d30e3d82f5fca501439c76fe21476c56764a",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-  "smokeScope": "CI SDK/native artifacts from testedCommit (run 35441525010: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a 0005dedd8158e64a4851b2e303f7f3b2e961314db2302eb2368c03291a0bf1d0, armeabi-v7a 4e7031364b9fde8232b777b5b1083a9904c1153a31368c1f914488b7cbf2ed10) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token, stateless token parser, unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The new offline context diagnostics were seen in logcat on the device (tag BeamSDK, 'offline context seq=1 phase=Unavailable reason=no-record ...'). The two ABIs used separate runIds (35441525010 and 35441525010-v7a). The harness has no funds and never starts the wallet, so it cannot sign offline: the signOffline crash after an online start() (Core patch 0019, run_ex stop callback) is covered off-device by the native host regression test in offline_signer_test, which failed on the previous patch stack and passes with 0019, and the context event log by offline_context_test and the Kotlin tests.",
+  "smokeScope": "CI SDK/native artifacts from testedCommit (run 38026845621: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a f791b838058cfb02e57b82490a0ed20922229fa30835552c3152d9b7fbdc5dc0, armeabi-v7a a7e6e9b0e7643a8398ca6ee7bd55a7131e594823a0568f3ee74d4ff2a6c642d1) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token, Regular receive token parsed back as Regular by the stateless parser (new in this release), unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (38026845621 and 38026845621-v7a). The harness has no funds and never starts the wallet, so the interactive (Regular) send path, cancelTransaction durability and concurrent-send admission are covered off-device by the native host tests (send_admission_test REGULAR_SEND_OK and the cancel/legacy-record scenarios, stateless_codec_test STATELESS_REGULAR_OK, offline_signer_test ONLINE_ONLY) and the Kotlin JNI fixture tests on the same source.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
@@ -10,7 +10,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-19T12:21:59Z"
+      "testedAtUtc": "2026-10-10T06:06:31Z"
     },
     "armeabi-v7a": {
       "status": "passed",
@@ -18,7 +18,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-09-19T12:22:14Z"
+      "testedAtUtc": "2026-10-10T06:07:52Z"
     }
   }
 }
