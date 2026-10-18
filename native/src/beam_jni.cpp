@@ -1235,12 +1235,18 @@ public:
 
     std::string receiveAddress(int ordinal) {
         return invokeOrUseStoppedDatabase<std::string>([this, ordinal]() {
-            auto token = beam::wallet::GenerateTokenDefaultAddr(tokenType(ordinal), database_);
-            return Json({
-                {"token", token},
+            WalletAddress wa;
+            database_->getDefaultAddressAlways(wa);
+            auto type = tokenType(ordinal);
+            Json address = {
+                {"token", beam::wallet::GenerateToken(type, wa, database_)},
                 {"type", tokenTypeName(ordinal)},
                 {"network", network_ == 0 ? "Mainnet" : "Testnet"},
-            }).dump();
+            };
+            if (type == TokenType::RegularNewStyle) {
+                address["sbbsAddress"] = beam::wallet::GenerateToken(TokenType::RegularOldStyle, wa, database_);
+            }
+            return address.dump();
         });
     }
 

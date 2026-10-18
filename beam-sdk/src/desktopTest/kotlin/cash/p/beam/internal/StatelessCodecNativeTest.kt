@@ -1,5 +1,6 @@
 package cash.p.beam.internal
 
+import cash.p.beam.BeamAddressType
 import cash.p.beam.BeamNetwork
 import cash.p.beam.BeamTokenParser
 import cash.p.beam.BeamTransactionInspector
@@ -36,5 +37,12 @@ class StatelessCodecNativeTest {
         assertFailsWith<IllegalArgumentException> { BeamCodecNative.inspect(byteArrayOf(1), 1, rules.signature) }
         // JVM exception state and native scopes must remain usable after failures.
         assertEquals(rules, BeamTransactionInspector.supportedRules(BeamNetwork.Mainnet))
+    }
+
+    @Test
+    fun parse_externalSbbsAddress_isRegular() {
+        // Real SBBS address produced by a third-party Beam web wallet.
+        val sbbsAddress = "e17cc06481d9ae88e1e0181efee407fa8c36a861b9df723845eddc8fb1ba552048"
+        assertEquals(BeamAddressType.Regular, BeamTokenParser.parse(sbbsAddress).type)
     }
 }

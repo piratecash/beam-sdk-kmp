@@ -160,6 +160,8 @@ public data class BeamAddress(
     val token: String,
     val type: BeamAddressType,
     val network: BeamNetwork,
+    /** SBBS address (old-style hex WalletID) of the same address; set only for [BeamAddressType.Regular]. */
+    val sbbsAddress: String? = null,
 )
 
 public enum class BeamTransactionDirection {

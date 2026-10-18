@@ -673,11 +673,17 @@ internal data class BalanceDto(
 }
 
 @Serializable
-private data class AddressDto(val token: String, val type: String, val network: String) {
+private data class AddressDto(
+    val token: String,
+    val type: String,
+    val network: String,
+    val sbbsAddress: String? = null,
+) {
     fun toDomain(): BeamAddress = BeamAddress(
         token = token,
         type = BeamAddressType.valueOf(type),
         network = BeamNetwork.valueOf(network),
+        sbbsAddress = sbbsAddress,
     )
 }
 

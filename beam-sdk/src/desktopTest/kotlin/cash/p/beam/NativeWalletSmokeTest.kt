@@ -6,6 +6,8 @@ import kotlin.io.path.deleteIfExists
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 
@@ -25,9 +27,13 @@ class NativeWalletSmokeTest {
                     assertEquals(BeamAddressType.PublicOffline, address.type)
                     assertEquals(BeamNetwork.Testnet, address.network)
                     check(address.token.isNotBlank())
+                    assertNull(address.sbbsAddress)
                     val regular = it.receiveAddress(BeamAddressType.Regular)
                     assertEquals(BeamAddressType.Regular, regular.type)
                     assertEquals(BeamAddressType.Regular, BeamTokenParser.parse(regular.token).type)
+                    val sbbsAddress = assertNotNull(regular.sbbsAddress)
+                    assertEquals(BeamAddressType.Regular, BeamTokenParser.parse(sbbsAddress).type)
+                    assertEquals(sbbsAddress, it.receiveAddress(BeamAddressType.Regular).sbbsAddress)
                     assertFailsWith<BeamFailure.Validation> {
                         BeamWalletFactory().openExisting(config, key)
                     }
