@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "4850d30e3d82f5fca501439c76fe21476c56764a",
+  "testedCommit": "a387d69cd8241e6a5fbaff75dbb22809bf4db00a",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-  "smokeScope": "CI SDK/native artifacts from testedCommit (run 38026845621: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a f791b838058cfb02e57b82490a0ed20922229fa30835552c3152d9b7fbdc5dc0, armeabi-v7a a7e6e9b0e7643a8398ca6ee7bd55a7131e594823a0568f3ee74d4ff2a6c642d1) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token, Regular receive token parsed back as Regular by the stateless parser (new in this release), unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (38026845621 and 38026845621-v7a). The harness has no funds and never starts the wallet, so the interactive (Regular) send path, cancelTransaction durability and concurrent-send admission are covered off-device by the native host tests (send_admission_test REGULAR_SEND_OK and the cancel/legacy-record scenarios, stateless_codec_test STATELESS_REGULAR_OK, offline_signer_test ONLINE_ONLY) and the Kotlin JNI fixture tests on the same source.",
+  "smokeScope": "CI SDK/native artifacts from testedCommit (run 39126735771: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a b977ab3452cef2839e1c75cde1b1aaa61b3676b5fdf924cd713533042b76ba1e, armeabi-v7a 20153e948550544d0c6695922ad31507456b64350f4d0cbc7c778b94dc36b251) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token without an SBBS address, Regular receive token and its SBBS address both parsed back as Regular by the stateless parser and the SBBS address stable across calls (new in this release), unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (39126735771 and 39126735771-v7a). The harness has no funds and never starts the wallet, so the interactive (Regular) send path is covered off-device by the native host tests and the Kotlin JNI fixture tests on the same source.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
@@ -10,7 +10,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-10-10T06:06:31Z"
+      "testedAtUtc": "2026-10-18T12:35:17Z"
     },
     "armeabi-v7a": {
       "status": "passed",
@@ -18,7 +18,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-10-10T06:07:52Z"
+      "testedAtUtc": "2026-10-18T12:35:44Z"
     }
   }
 }
