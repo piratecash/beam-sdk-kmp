@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "testedCommit": "a387d69cd8241e6a5fbaff75dbb22809bf4db00a",
+  "testedCommit": "c0b07172e3ff09d83676d5c63a9a007b8c0f54ba",
   "coreCommit": "9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
-  "smokeScope": "CI SDK/native artifacts from testedCommit (run 39126735771: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a b977ab3452cef2839e1c75cde1b1aaa61b3676b5fdf924cd713533042b76ba1e, armeabi-v7a 20153e948550544d0c6695922ad31507456b64350f4d0cbc7c778b94dc36b251) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token without an SBBS address, Regular receive token and its SBBS address both parsed back as Regular by the stateless parser and the SBBS address stable across calls (new in this release), unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (39126735771 and 39126735771-v7a). The harness has no funds and never starts the wallet, so the interactive (Regular) send path is covered off-device by the native host tests and the Kotlin JNI fixture tests on the same source.",
+  "smokeScope": "CI SDK/native artifacts from testedCommit (run 42797192607: android-aar and native-android, identical .so sha256 per ABI, and identical again inside the harness APK; arm64-v8a aef02a7a3a99b9c7b0b219b972ecec84715e51ec18bbc32b4acd8ce67bde9544, armeabi-v7a 167b4e6fa4e2b7b6ae8d4407cb307da1e3dc919c1d9d210d5fbf4b2811b103da) in an isolated Testnet sample with a random seed and no INTERNET permission: create, cold reopen, PublicOffline receive token without an SBBS address, Regular receive token and its SBBS address both parsed back as Regular by the stateless parser and the SBBS address stable across calls, unfunded offline quote rejected, empty send inventory after reopen; no network start or send. The two ABIs used separate runIds (42797192607 and 42797192607-v7a). This release only adds Core patches 0020/0021 (peer-supplied sender role and shielded coin TxID); the attack scenarios themselves are covered by the native peer_input host test on the same source, since the harness never starts the wallet.",
   "android": {
     "arm64-v8a": {
       "status": "passed",
@@ -10,7 +10,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-10-18T12:35:17Z"
+      "testedAtUtc": "2026-11-10T10:37:40Z"
     },
     "armeabi-v7a": {
       "status": "passed",
@@ -18,7 +18,7 @@
       "apiLevel": 37,
       "nativeVersion": "beam-7.5.14493+9c4366aae08e7fbde7bc8d65f828a0deace68bfc",
       "walletSmoke": "passed",
-      "testedAtUtc": "2026-10-18T12:35:44Z"
+      "testedAtUtc": "2026-11-10T10:38:15Z"
     }
   }
 }
