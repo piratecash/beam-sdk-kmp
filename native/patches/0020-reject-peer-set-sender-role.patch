@@ -1,0 +1,82 @@
+diff --git a/wallet/core/simple_transaction.cpp b/wallet/core/simple_transaction.cpp
+index ce69a6236..6125d6436 100644
+--- a/wallet/core/simple_transaction.cpp
++++ b/wallet/core/simple_transaction.cpp
+@@ -121,7 +121,6 @@ namespace beam::wallet
+ 
+         switch (paramID)
+         {
+-        case TxParameterID::IsSender: // TODO - change this. It should be checked and set by Creator during construction
+         case TxParameterID::Amount:
+         case TxParameterID::AssetID:
+         case TxParameterID::Fee:
+diff --git a/wallet/core/wallet.cpp b/wallet/core/wallet.cpp
+index 72e122ac5..8749b3b9f 100644
+--- a/wallet/core/wallet.cpp
++++ b/wallet/core/wallet.cpp
+@@ -3759,10 +3759,7 @@ namespace beam::wallet
+         {
+             TxType type = TxType::Simple;
+             if (storage::getTxParameter(*m_WalletDB, msg.m_TxID, TxParameterID::TransactionType, type)) {
+-                // This request has already been processed
+-                // assert should always be OK, if triggered means that we have mistake in the code OR
+-                // somebody is trying to tamper with our transactions
+-                assert(type == msg.m_Type);
++                // This request has already been processed; a different type here comes from the peer, not from us
+                 return;
+             }
+         }
+@@ -3773,6 +3770,16 @@ namespace beam::wallet
+             return;
+         }
+ 
++        // GetParameter reads any sub-tx, but only default sub-tx values reach the tx; Simple and DEX txs never carry another one
++        for (const auto& p : msg.m_Parameters)
++        {
++            if (p.first == TxParameterID::SubTxIndex)
++            {
++                BEAM_LOG_WARNING() << msg.m_TxID << " Incoming tx with sub-tx parameters rejected";
++                return;
++            }
++        }
++
+         bool isSender = false;
+         if (!msg.GetParameter(TxParameterID::IsSender, isSender))
+         {
+@@ -3783,7 +3790,7 @@ namespace beam::wallet
+         if (isSender)
+         {
+             // TxParameterID::IsSender should always be false if it is coming from outside
+-            assert(false);
++            BEAM_LOG_WARNING() << msg.m_TxID << " Incoming tx that makes us the sender rejected";
+             return;
+         }
+ 
+@@ -3821,6 +3828,7 @@ namespace beam::wallet
+             pTx->SetParameter(TxParameterID::MyAddr, myID, false);
+             pTx->SetParameter(TxParameterID::PeerAddr, msg.m_From, false);
+             pTx->SetParameter(TxParameterID::IsInitiator, false, false);
++            pTx->SetParameter(TxParameterID::IsSender, false, false); // set locally, peers can't set it
+             pTx->SetParameter(TxParameterID::Status, TxStatus::Pending, true);
+ 
+             auto address = m_WalletDB->getAddress(myID);
+@@ -3842,7 +3850,6 @@ namespace beam::wallet
+         }
+         else
+         {
+-            assert(false);
+             BEAM_LOG_WARNING() << "Unsupported TX Type requested via SBBS: "
+                           << " type: " << static_cast<unsigned int>(msg.m_Type)
+                           << " txid: " << msg.m_TxID;
+diff --git a/wallet/transactions/dex/dex_tx.cpp b/wallet/transactions/dex/dex_tx.cpp
+index 74acefe3c..107ebd4b5 100644
+--- a/wallet/transactions/dex/dex_tx.cpp
++++ b/wallet/transactions/dex/dex_tx.cpp
+@@ -123,7 +123,6 @@ namespace beam::wallet
+ 
+         switch (paramID)
+         {
+-        case TxParameterID::IsSender: // TODO:DEX - change this. It should be checked and set by Creator during construction
+         case TxParameterID::Amount:
+         case TxParameterID::AssetID:
+         case TxParameterID::DexReceiveAmount:

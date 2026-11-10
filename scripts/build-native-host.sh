@@ -83,7 +83,7 @@ if [[ "${BEAM_NATIVE_TESTS:-0}" == "1" ]]; then
         build_target "beam_sdk_kmp_${fixture}_fixture"
     done
     build_target beam_sdk_kmp_offline_history_fixture
-    for test in offline_context offline_signing stateless_codec offline_signer transaction_relay; do
+    for test in offline_context offline_signing stateless_codec offline_signer transaction_relay peer_input; do
         run_test_target "beam_sdk_kmp_${test}_tests"
     done
     offline_signer_binary="$(test_binary_path beam_sdk_kmp_offline_signer_tests)"
